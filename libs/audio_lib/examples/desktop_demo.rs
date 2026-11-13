@@ -11,13 +11,17 @@ use std::time::Duration;
 use audio_lib::{Player, SeekTo};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("用法: {} <音频文件>", std::env::args().next().unwrap());
+    let arg = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("用法: {} <音频文件或URL>", std::env::args().next().unwrap());
         std::process::exit(1);
     });
 
-    let player = Player::open(&path)?;
-    println!("已加载: {path}");
+    let player = if arg.starts_with("http://") || arg.starts_with("https://") {
+        Player::open_url(&arg)?
+    } else {
+        Player::open(&arg)?
+    };
+    println!("已加载: {arg}");
     println!("  采样率: {} Hz", player.sample_rate());
     println!("  声道数: {}", player.channels());
     println!("  总时长: {:?}", player.duration());

@@ -8,24 +8,24 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 
 /**
- * The thinnest possible shell. It owns exactly three things the Rust side
- * cannot get for itself:
+ * 尽可能薄的壳。它只拥有三样 Rust 侧自己拿不到的东西：
  *
- *   1. the [SurfaceView] / [SurfaceHolder] (the native window + its lifetime),
- *   2. the Activity lifecycle (resume / pause / destroy),
- *   3. raw input dispatch (touch + key events).
+ *   1. [SurfaceView] / [SurfaceHolder]（native window + 它的生命周期），
+ *   2. Activity 生命周期（resume / pause / destroy），
+ *   3. 原始输入分发（触摸 + 按键事件）。
  *
- * Everything else — window creation, rendering, the whole UI tree — lives in
- * Rust (`gpuidemo-core` on gpui-kit, hosted by gpui-mobile's `android::host`).
- * There is deliberately no Kotlin UI logic here.
+ * 其余一切 —— 窗口创建、渲染、整个 UI 树 —— 都在 Rust 里
+ * （`gpuidemo-core`，基于 gpui-kit，由 gpui-mobile 的 `android::host` 承载）。
+ * 这里刻意不写任何 Kotlin UI 逻辑。
  *
- * Each callback forwards to a `native*` function implemented in
- * `rust/android/src/lib.rs`, which hands the event to `gpui_mobile::android::host`.
+ * 每个回调都转发给一个在 `rust/android/src/lib.rs` 里实现的 `native*` 函数，
+ * 由它把事件交给 `gpui_mobile::android::host`。
  */
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
@@ -34,15 +34,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Register this Activity with the Rust host and (on first launch only)
-        // spawn the render thread. Safe to call on every onCreate.
+        // 把这个 Activity 注册给 Rust host，并（只在首次启动时）
+        // 拉起渲染线程。每次 onCreate 调用都是安全的。
         nativeCreate(this)
 
         surfaceView = SurfaceView(this)
         surfaceView.holder.addCallback(this)
 
-        // The Rust renderer paints the entire surface, so keep the window from
-        // drawing anything behind it and go truly edge-to-edge.
+        // Rust 渲染器会绘制整块 surface，所以要阻止窗口在它背后绘制任何东西，
+        // 做到真正的全面屏。
         window.setBackgroundDrawable(null)
         window.setFlags(
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
@@ -51,16 +51,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         setContentView(surfaceView)
 
-        // Hide the system bars for an immersive, full-bleed canvas.
+        // 隐藏系统栏，得到沉浸式、铺满全屏的画布。
         hideSystemBars()
     }
 
     @TargetApi(Build.VERSION_CODES.R)
     private fun hideSystemBars() {
-        // `window.insetsController` is API 30+ and returns null below that; the
-        // `?.let` guard makes this a no-op on API 26–29 (minSdk is 26).
+        // `window.insetsController` 是 API 30+ 才有的，更低版本返回 null；
+        // `?.let` 守卫让它在 API 26–29 上变成空操作（minSdk 是 26）。
         window.insetsController?.let { controller ->
-            // The `Type` constants live on `WindowInsets`, not the controller.
+            // `Type` 常量在 `WindowInsets` 上，不在 controller 上。
             controller.hide(WindowInsets.Type.systemBars())
             controller.systemBarsBehavior =
                 WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -73,18 +73,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         nativeSurfaceCreated(holder.surface, resources.displayMetrics.density)
     }
 
-    // Also forwarded: a size change re-attaches / resizes the same surface.
+    // 一并转发：尺寸变化会重新 attach / 调整同一块 surface。
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         nativeSurfaceCreated(holder.surface, resources.displayMetrics.density)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // nativeSurfaceDestroyed blocks until the render thread stops using the
-        // surface, so it is safe for the framework to recycle it afterwards.
+        // nativeSurfaceDestroyed 会阻塞，直到渲染线程停止使用这块 surface，
+        // 所以之后框架回收它是安全的。
         nativeSurfaceDestroyed()
     }
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────
+    // ── 生命周期 ─────────────────────────────────────────────────────────
 
     override fun onResume() {
         super.onResume()
@@ -97,7 +96,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         super.onPause()
     }
 
-    // ── Input ─────────────────────────────────────────────────────────────
+    // ── 输入 ─────────────────────────────────────────────────────────────
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val handled = nativeTouch(
@@ -120,7 +119,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return true
     }
 
-    // ── Native bridge ─────────────────────────────────────────────────────
+    // ── Native 桥 ─────────────────────────────────────────────────────────
+    //
+    // 在 rust/android/src/lib.rs 里实现。`_1` 是 `gpui_demo` 包名里
+    // 下划线的 JNI 转义。
+
     private external fun nativeCreate(activity: Activity)
     private external fun nativeSurfaceCreated(surface: android.view.Surface, scale: Float)
     private external fun nativeSurfaceDestroyed()
@@ -137,9 +140,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         init {
-            // Loads libandroid_lib.so (built by cargo ndk into jniLibs/{arm64-v8a,x86_64}).
-            // The crate name in rust-lib/android-lib/Cargo.toml is `android_lib`,
-            // and JNI symbols like nativeCreate live in that .so.
+            // 加载 libgpuidemo.so（由 cargo ndk 构建到 jniLibs/x86_64）。
             System.loadLibrary("android_lib")
         }
     }

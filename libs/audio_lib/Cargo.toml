@@ -7,6 +7,13 @@ version.workspace = true
 cpal = "0.16"
 symphonia = { version = "0.5", features = ["all"] }
 
+# URL 播放：HTTP(S) 流式拉取。rustls 避免 OpenSSL 依赖，交叉编译 Android 更省心。
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+
+[features]
+default = ["url"]
+url = ["dep:ureq"]
+
 [dev-dependencies]
 ctrlc = "3"
 cpal = "0.16"

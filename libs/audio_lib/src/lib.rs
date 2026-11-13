@@ -35,6 +35,22 @@
 //! # }
 //! ```
 //!
+//! # 播放网络 URL
+//!
+//! 开启 `url` feature（默认开启）即可直接播放 HTTP(S) 链接：
+//!
+//! ```no_run
+//! # fn main() -> Result<(), audio_lib::AudioError> {
+//! let player = audio_lib::Player::open_url("https://example.com/song.mp3")?;
+//! player.play();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! 网络字节在后台线程用 HTTP Range 顺序拉取，Seek 会中断当前下载并从新位置重新拉取，
+//! 因此即使在慢速网络下 Seek 也能及时响应。若只需本地文件，可用
+//! `default-features = false` 关掉 `url` 以减小体积（不引入 TLS 依赖）。
+//!
 //! # 设计要点
 //!
 //! - **解码与播放解耦**：独立的解码线程把任意格式统一转成交错立体声 f32，
@@ -47,5 +63,7 @@
 
 pub mod player;
 pub mod ring_buffer;
+#[cfg(feature = "url")]
+pub mod http_source;
 
 pub use player::{AudioError, NotifyCallback, Player, Result, SeekTo};

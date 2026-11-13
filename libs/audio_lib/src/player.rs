@@ -29,6 +29,8 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::ring_buffer::RingBuffer;
+#[cfg(feature = "url")]
+use crate::http_source::HttpSource;
 
 /// 解码线程在环形缓冲里攒够多少**帧**后开始退避（约 1.4 秒 @48kHz）。
 const DEFAULT_BUFFER_FRAMES: usize = 1 << 16;
@@ -197,6 +199,9 @@ struct Shared {
     ring: RingBuffer,
     /// 解码线程在缓冲满时 park 在这里；控制线程 Seek / Drop 时 notify 唤醒。
     decode_pair: (Mutex<bool>, Condvar),
+    /// 网络流中断句柄（仅 URL 播放用到）。Seek 时置位，打断阻塞在网络 read 上的解码线程，
+    /// 让它赶紧回到循环处理 Seek 命令。本地文件为 None（读不会阻塞）。
+    pub(crate) interrupt: Mutex<Option<Arc<AtomicBool>>>,
 
     // -- 结束回调 --
     /// 播放结束回调。用 Mutex<Option> 让音频回调能安全取走克隆。
@@ -304,6 +309,34 @@ impl Player {
         source: Box<dyn MediaSource>,
         hint_ext: Option<&str>,
     ) -> Result<Arc<Self>> {
+        Self::build(source, hint_ext, None)
+    }
+
+    /// 打开一个 HTTP(S) 音频 URL 并开始流式预解码（需要 `url` feature，默认开启）。
+    ///
+    /// 网络字节在后台线程用 Range 请求顺序拉取；Seek 会中断阻塞中的下载并从新位置重新拉取。
+    /// 返回的 `Player` 处于**暂停**态，需要显式调用 [`Player::play`]。
+    ///
+    /// 注意：探测容器头需要先下载前几十 KB，首次 `open_url` 会阻塞到这部分到达。
+    #[cfg(feature = "url")]
+    pub fn open_url(url: impl AsRef<str>) -> Result<Arc<Self>> {
+        let url = url.as_ref();
+        // 从扩展名猜格式提示（去掉 query string）。
+        let ext = url
+            .split(['?', '#'])
+            .next()
+            .and_then(|p| p.rsplit('.').next())
+            .filter(|e| e.len() <= 5 && !e.contains('/'));
+        let source = HttpSource::new(url).map_err(AudioError::Io)?;
+        let interrupt = source.interrupt_handle();
+        Self::build(Box::new(source), ext, Some(interrupt))
+    }
+
+    fn build(
+        source: Box<dyn MediaSource>,
+        hint_ext: Option<&str>,
+        interrupt: Option<Arc<AtomicBool>>,
+    ) -> Result<Arc<Self>> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or(AudioError::NoOutputDevice)?;
@@ -362,6 +395,7 @@ impl Player {
             position_ns: AtomicU64::new(0),
             ring: RingBuffer::with_capacity(DEFAULT_BUFFER_FRAMES * 2), // *2: 交错两声道
             decode_pair: (Mutex::new(false), Condvar::new()),
+            interrupt: Mutex::new(interrupt),
             on_end: Mutex::new(None),
         });
 
@@ -474,6 +508,13 @@ impl Player {
         // 置 seeking 让回调立刻静音并停止推进 position，
         // 直到解码线程落地到新位置（do_seek 里清除）。
         self.shared.seeking.store(true, Ordering::Relaxed);
+        // URL 播放：先置中断，打断可能阻塞在网络 read 上的解码线程，
+        // 让它能回到循环处理下面的 Seek 命令。必须在发命令前置位。
+        if let Ok(guard) = self.shared.interrupt.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.store(true, Ordering::Relaxed);
+        }
         self.shared.wake_decoder();
         let _ = self.cmd_tx.send(Cmd::Seek(abs));
     }
@@ -585,6 +626,23 @@ fn run_decoder(
                 continue;
             }
             Err(_) => {
+                // URL Seek 会中断阻塞中的网络 read（ErrorKind::Interrupted），
+                // 这不是 EOF。清掉中断标记，短暂让出，回到循环顶部处理待处理的 Seek 命令。
+                let interrupted = shared
+                    .interrupt
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .is_some_and(|h| h.load(Ordering::Relaxed));
+                if interrupted {
+                    if let Ok(g) = shared.interrupt.lock()
+                        && let Some(h) = g.as_ref()
+                    {
+                        h.store(false, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(PARK_TIMEOUT);
+                    continue;
+                }
                 // ResetRequired / 其他不可恢复错误：当作到尾处理。
                 shared.eof.store(true, Ordering::Relaxed);
                 decode_finished = true;
