@@ -1,0 +1,12 @@
+[package]
+name = "audio_lib"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cpal = "0.16"
+symphonia = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+ctrlc = "3"
+cpal = "0.16"
