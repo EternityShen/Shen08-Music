@@ -1,6 +1,9 @@
 //! 桌面端命令行演示：播放一个音频文件，展示播放/暂停/Seek/音量/声像/结束回调。
 //!
 //! 用法：`cargo run --release --example desktop_demo -- /path/to/song.mp3`
+//!       （也可传 HTTP(S) URL）
+//!
+//! 演示 `Player::new()` 建空句柄 + `load_file` / `load_url` 加载音源的两步式用法。
 //!
 //! 按键控制：空格=暂停/继续，←/→=快退/快进 5 秒，↑/↓=音量，q=退出。
 //! （简单起见用行输入模拟控制，真实 GUI 里把这些方法接到你的 UI 事件即可。）
@@ -16,11 +19,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
-    let player = if arg.starts_with("http://") || arg.starts_with("https://") {
-        Player::open_url(&arg)?
+    // 先建一个空句柄，再按需加载音源（也可用 Player::open / open_url 一步到位）。
+    let player = Player::new()?;
+    let is_url = arg.starts_with("http://") || arg.starts_with("https://");
+
+    #[cfg(feature = "url")]
+    if is_url {
+        player.load_url(&arg)?;
     } else {
-        Player::open(&arg)?
-    };
+        player.load_file(&arg)?;
+    }
+
+    // 无 url feature：URL 参数不支持，只接受本地文件。
+    #[cfg(not(feature = "url"))]
+    if is_url {
+        eprintln!("此构建未开启 url feature，无法播放 URL，请传本地文件路径。");
+        std::process::exit(1);
+    } else {
+        player.load_file(&arg)?;
+    }
     println!("已加载: {arg}");
     println!("  采样率: {} Hz", player.sample_rate());
     println!("  声道数: {}", player.channels());
@@ -36,9 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(y) = meta.year { println!("    年份: {y}"); }
     }
 
-    // 淡入淡出各 0.5 秒，播放/暂停自动平滑（避免爆音）
-    player.fade().set_fade_in(Duration::from_millis(500), player.sample_rate());
-    player.fade().set_fade_out(Duration::from_millis(500), player.sample_rate());
+    // 淡入淡出各 0.5 秒，播放/暂停自动平滑（避免爆音）。
+    // 时长按 wall-clock 存，换源（采样率变化）后依然准确，无需再传采样率。
+    player.fade().set_fade_in(Duration::from_millis(500));
+    player.fade().set_fade_out(Duration::from_millis(500));
 
     // 播放结束回调（在独立线程触发，可安全做 UI 投递）
     player.set_on_end(|| println!("\n[事件] 播放结束"));
@@ -118,14 +136,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 手动设淡入时长（毫秒）
             "fadein" => match arg.parse::<u64>() {
                 Ok(ms) => {
-                    player.fade().set_fade_in(Duration::from_millis(ms), player.sample_rate());
+                    player.fade().set_fade_in(Duration::from_millis(ms));
                     println!("-> 淡入 {}ms", ms);
                 }
                 Err(_) => println!("用法: fadein <毫秒>"),
             },
             "fadeout" => match arg.parse::<u64>() {
                 Ok(ms) => {
-                    player.fade().set_fade_out(Duration::from_millis(ms), player.sample_rate());
+                    player.fade().set_fade_out(Duration::from_millis(ms));
                     println!("-> 淡出 {}ms", ms);
                 }
                 Err(_) => println!("用法: fadeout <毫秒>"),

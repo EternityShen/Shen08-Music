@@ -7,7 +7,10 @@
 //! - **CPAL 回调**：实时音频线程，从环形缓冲取采样，套音量/声像后写进输出。
 //!   绝不加锁、不分配、不阻塞，缓冲空了就补静音。
 //!
-//! 这样解码抖动不会直接打到音频回调上，Seek 也只需要和环形缓冲 + 解码线程打交道。
+//! `Player` 把**构造**（[`Player::new`]，只开设备、建共享状态）和**加载音源**
+//! （[`Player::play_file`] / [`Player::play_url`] / [`Player::load_source`]）分开：
+//! 可以先建一个空句柄，之后随时换歌。换源时会按新采样率重建输出流并重启解码线程，
+//! 而音量/声像/均衡器/淡变/捕获等用户设置保存在 [`Shared`] 里跨源保留。
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, Ordering};
@@ -29,6 +32,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::ring_buffer::RingBuffer;
+
 #[cfg(feature = "url")]
 use crate::http_source::HttpSource;
 
@@ -36,9 +40,14 @@ use crate::eq::{EqState, Equalizer, EQ_BAND_FREQS};
 use crate::fade::FadeState;
 use crate::metadata::TrackMetadata;
 
-/// 解码线程在环形缓冲里攒够多少**帧**后开始退避（约 1.4 秒 @48kHz）。
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+/// 环形缓冲容量（帧）。1<<16 = 65536 帧，约 1.5 秒立体声（44.1kHz）。
 const DEFAULT_BUFFER_FRAMES: usize = 1 << 16;
-/// 缓冲满时退避/ park 的超时时长。也用作命令轮询间隔。
+
+/// 解码线程 park 超时。既能在被唤醒时立刻响应，又能在回调消费数据后自动重试。
 const PARK_TIMEOUT: Duration = Duration::from_millis(10);
 
 // ---------------------------------------------------------------------------
@@ -169,14 +178,18 @@ enum Cmd {
 // ---------------------------------------------------------------------------
 
 /// 控制线程、解码线程、音频回调三方共享的状态。
+///
+/// 这份状态在 `Player` 的整个生命周期内**持久存在**，换源（`play_file` / `play_url`）
+/// 时只更新音源相关字段（采样率/总帧数/标签/中断句柄）并复位播放进度，
+/// 用户设置（音量/声像/均衡器/淡变/捕获/回调）跨源保留。
 struct Shared {
-    // -- 音频参数（构造后不变，无锁读）--
-    /// 解码采样率，用于时长/位置换算。
-    sample_rate: u32,
+    // -- 音源参数（换源时可变，原子无锁读）--
+    /// 解码采样率，用于时长/位置换算。换源时更新。
+    sample_rate: AtomicU32,
     /// 输出声道数（当前实现恒为 2）。
     channels: usize,
-    /// 音轨总帧数，未知为 0。
-    total_frames: u64,
+    /// 音轨总帧数，未知为 0。换源时更新。
+    total_frames: AtomicU64,
 
     // -- 播放控制（原子，无锁读写）--
     /// 音量 0.0 ~ 1.0，bit-cast 成 u32 存。
@@ -192,8 +205,6 @@ struct Shared {
     seeking: AtomicBool,
     /// 播放是否已结束（EOF 且缓冲耗尽后置位，用于一次性触发 on_end）。
     finished: AtomicBool,
-    /// 控制线程请求解码线程退出。
-    stop: AtomicBool,
     /// 当前绝对播放位置，单位纳秒。音频回调按帧推进，Seek 时由控制线程
     /// 直接写成目标位置（立即生效，UI 无需等解码落地）。
     position_ns: AtomicU64,
@@ -201,20 +212,21 @@ struct Shared {
     // -- 环形缓冲 & 解码线程 park --
     /// 交错立体声环形缓冲。
     ring: RingBuffer,
-    /// 解码线程在缓冲满时 park 在这里；控制线程 Seek / Drop 时 notify 唤醒。
+    /// 解码线程在缓冲满时 park 在这里；控制线程 Seek / Drop / 换源时 notify 唤醒。
     decode_pair: (Mutex<bool>, Condvar),
-    /// 网络流中断句柄（仅 URL 播放用到）。Seek 时置位，打断阻塞在网络 read 上的解码线程，
-    /// 让它赶紧回到循环处理 Seek 命令。本地文件为 None（读不会阻塞）。
+    /// 网络流中断句柄（仅 URL 播放用到）。Seek / 换源时置位，打断阻塞在网络 read 上的
+    /// 解码线程，让它赶紧回到循环处理命令。本地文件为 None（读不会阻塞）。
     pub(crate) interrupt: Mutex<Option<Arc<AtomicBool>>>,
 
     // -- 均衡器 --
     /// 均衡器参数（系数用 ArcSwap 原子换入）。控制线程改，回调无锁读。
+    /// 换源时按新采样率重算系数（保留用户增益）。
     eq: Equalizer,
     /// 均衡器各声道滤波器状态。只有音频回调读写，锁几乎无竞争。
     eq_state: Mutex<EqState>,
 
     // -- 淡入淡出 --
-    /// 淡变包络状态（内部全原子，回调无锁读）。
+    /// 淡变包络状态（内部全原子，回调无锁读）。时长按 wall-clock 存，跨采样率有效。
     fade: FadeState,
 
     // -- 播放样本捕获 --
@@ -224,8 +236,8 @@ struct Shared {
     capture_enabled: AtomicBool,
 
     // -- 标签信息 --
-    /// 打开文件时提取的标签，只读。
-    metadata: TrackMetadata,
+    /// 打开音源时提取的标签。换源时更新，用 Mutex 保护（控制线程读写）。
+    metadata: Mutex<TrackMetadata>,
 
     // -- 结束回调 --
     /// 播放结束回调。用 Mutex<Option> 让音频回调能安全取走克隆。
@@ -241,6 +253,11 @@ impl Shared {
         self.pan.load(Ordering::Relaxed) as f32 / 64.0
     }
 
+    /// 当前解码采样率。
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Relaxed)
+    }
+
     /// 已播放时长。Seek 时控制线程直接写成目标值，因此立即生效。
     fn position(&self) -> Duration {
         Duration::from_nanos(self.position_ns.load(Ordering::Relaxed))
@@ -248,12 +265,12 @@ impl Shared {
 
     /// 音轨总时长，未知为 None。
     fn duration(&self) -> Option<Duration> {
-        if self.total_frames == 0 || self.sample_rate == 0 {
+        let sr = self.sample_rate();
+        let total = self.total_frames.load(Ordering::Relaxed);
+        if total == 0 || sr == 0 {
             None
         } else {
-            Some(Duration::from_secs_f64(
-                self.total_frames as f64 / self.sample_rate as f64,
-            ))
+            Some(Duration::from_secs_f64(total as f64 / sr as f64))
         }
     }
 
@@ -273,15 +290,42 @@ impl Shared {
 
 /// 一个可播放、暂停、Seek 的音频播放器。
 ///
-/// 内部持有 CPAL 输出流和一个专用解码线程。构造后处于**暂停**态，
+/// 内部持有 CPAL 输出流和一个专用解码线程。[`Player::new`] 建好设备与共享状态，
+/// 但**未加载任何音源**；随后调用 [`Player::play_file`] / [`Player::play_url`] /
+/// [`Player::load_source`] 加载音源。加载后处于**暂停**态，
 /// 需要显式调用 [`Player::play`] 才会发声。
 ///
 /// 通常包在 `Arc` 里跨线程共享；`Player` 本身 `Send + Sync`。
 pub struct Player {
     shared: Arc<Shared>,
-    stream: Stream,
-    decoder: Mutex<Option<JoinHandle<()>>>,
-    cmd_tx: std::sync::mpsc::Sender<Cmd>,
+    /// 输出设备。换源时用它重建输出流（不同音源采样率可能不同）。
+    device: cpal::Device,
+    /// 当前加载的音源运行时（输出流 + 解码线程 + 命令通道 + 停止标记）。
+    /// 用 Mutex 保护，换源时可整体替换。空表示尚未加载。
+    inner: Mutex<PlayerRuntime>,
+}
+
+/// 当前加载音源的运行时资源。换源时整体 drop 旧的、建新的。
+struct PlayerRuntime {
+    /// CPAL 输出流。回调从环形缓冲取数据。
+    stream: Option<Stream>,
+    /// 解码线程句柄。
+    decoder: Option<JoinHandle<()>>,
+    /// 控制线程 -> 解码线程命令通道。
+    cmd_tx: Option<std::sync::mpsc::Sender<Cmd>>,
+    /// 当前解码线程的停止标记。换源 / Drop 时置位让它退出。
+    stop: Arc<AtomicBool>,
+}
+
+impl Default for PlayerRuntime {
+    fn default() -> Self {
+        Self {
+            stream: None,
+            decoder: None,
+            cmd_tx: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl fmt::Debug for Player {
@@ -301,13 +345,15 @@ impl fmt::Debug for Player {
 impl Drop for Player {
     fn drop(&mut self) {
         // 顺序：停流 -> 通知解码线程退出 -> 唤醒可能 park 的解码线程 -> join。
-        let _ = self.stream.pause();
-        self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.wake_decoder();
-        if let Ok(mut guard) = self.decoder.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.join();
+        if let Ok(mut rt) = self.inner.lock() {
+            rt.stop.store(true, Ordering::Relaxed);
+            if let Some(stream) = rt.stream.as_ref() {
+                let _ = stream.pause();
+            }
+            self.shared.wake_decoder();
+            if let Some(handle) = rt.decoder.take() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -315,35 +361,87 @@ impl Drop for Player {
 impl Player {
     // -- 构建 ---------------------------------------------------------------
 
-    /// 用默认输出设备打开一个音频文件并开始预解码。
+    /// 创建一个空播放器句柄（只开默认输出设备、建好共享状态，**不加载任何音源**）。
     ///
-    /// `Player` 建好输出流并启动解码线程，但处于**暂停**态，
-    /// 需要显式调用 [`Player::play`] 才会发声。
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Arc<Self>> {
+    /// 随后用 [`Player::play_file`] / [`Player::play_url`] / [`Player::load_source`]
+    /// 加载音源。音量/声像/均衡器/淡变/捕获等设置此时即可配置，加载后立即生效。
+    ///
+    /// # 示例
+    /// ```no_run
+    /// use audio_lib::Player;
+    /// # fn main() -> Result<(), audio_lib::AudioError> {
+    /// let player = Player::new()?;        // 空句柄
+    /// player.play_file("song.mp3")?;      // 加载并播放
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new() -> Result<Arc<Self>> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or(AudioError::NoOutputDevice)?;
+
+        // 捕获缓冲：约 1 秒立体声样本，容量取 2 的幂（读不及时新样本覆盖旧的）。
+        let capture_cap = (48_000usize * 2).next_power_of_two();
+        let shared = Arc::new(Shared {
+            sample_rate: AtomicU32::new(0),
+            channels: 2,
+            total_frames: AtomicU64::new(0),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            pan: AtomicI8::new(0),
+            paused: AtomicBool::new(true),
+            eof: AtomicBool::new(false),
+            seeking: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            position_ns: AtomicU64::new(0),
+            ring: RingBuffer::with_capacity(DEFAULT_BUFFER_FRAMES * 2), // *2: 交错两声道
+            decode_pair: (Mutex::new(false), Condvar::new()),
+            interrupt: Mutex::new(None),
+            eq: Equalizer::new(44_100),
+            eq_state: Mutex::new(EqState::new(2, EQ_BAND_FREQS.len())),
+            fade: FadeState::new(44_100),
+            capture_ring: Arc::new(RingBuffer::with_capacity(capture_cap)),
+            capture_enabled: AtomicBool::new(false),
+            metadata: Mutex::new(TrackMetadata::default()),
+            on_end: Mutex::new(None),
+        });
+
+        Ok(Arc::new(Self {
+            shared,
+            device,
+            inner: Mutex::new(PlayerRuntime::default()),
+        }))
+    }
+
+    // -- 加载音源 -----------------------------------------------------------
+
+    /// 加载一个本地音频文件（**保持暂停**，需显式 [`Player::play`]）。
+    ///
+    /// 换源时会停掉旧解码线程、按新采样率重建输出流、更新标签并复位播放进度；
+    /// 音量/声像/均衡器/淡变/捕获等用户设置跨源保留。
+    pub fn load_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
         let ext = path.extension().and_then(|e| e.to_str()).map(str::to_owned);
-        Self::open_source(Box::new(file), ext.as_deref())
+        self.load_source(Box::new(file), ext.as_deref())
     }
 
-    /// 从任意 `MediaSource`（字节流、内存 buffer 等）打开。
+    /// 加载并**立即播放**一个本地音频文件。
     ///
-    /// `hint_ext` 用于辅助探测格式，通常是文件扩展名，如 `Some("mp3")`。
-    pub fn open_source(
-        source: Box<dyn MediaSource>,
-        hint_ext: Option<&str>,
-    ) -> Result<Arc<Self>> {
-        Self::build(source, hint_ext, None)
+    /// 等价于 [`Player::load_file`] + [`Player::play`]。
+    pub fn play_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        self.load_file(path)?;
+        self.play();
+        Ok(())
     }
 
-    /// 打开一个 HTTP(S) 音频 URL 并开始流式预解码（需要 `url` feature，默认开启）。
+    /// 加载一个 HTTP(S) 音频 URL（**保持暂停**，需显式 [`Player::play`]）。
     ///
-    /// 网络字节在后台线程用 Range 请求顺序拉取；Seek 会中断阻塞中的下载并从新位置重新拉取。
-    /// 返回的 `Player` 处于**暂停**态，需要显式调用 [`Player::play`]。
+    /// 需要 `url` feature（默认开启）。网络字节在后台线程用 Range 请求顺序拉取；
+    /// Seek 会中断阻塞中的下载并从新位置重新拉取。
     ///
-    /// 注意：探测容器头需要先下载前几十 KB，首次 `open_url` 会阻塞到这部分到达。
+    /// 注意：探测容器头需要先下载前几十 KB，首次加载会阻塞到这部分到达。
     #[cfg(feature = "url")]
-    pub fn open_url(url: impl AsRef<str>) -> Result<Arc<Self>> {
+    pub fn load_url(&self, url: impl AsRef<str>) -> Result<()> {
         let url = url.as_ref();
         // 从扩展名猜格式提示（去掉 query string）。
         let ext = url
@@ -353,18 +451,33 @@ impl Player {
             .filter(|e| e.len() <= 5 && !e.contains('/'));
         let source = HttpSource::new(url).map_err(AudioError::Io)?;
         let interrupt = source.interrupt_handle();
-        Self::build(Box::new(source), ext, Some(interrupt))
+        self.load_source_inner(Box::new(source), ext, Some(interrupt))
     }
 
-    fn build(
+    /// 加载并**立即播放**一个 HTTP(S) 音频 URL（需要 `url` feature，默认开启）。
+    ///
+    /// 等价于 [`Player::load_url`] + [`Player::play`]。
+    #[cfg(feature = "url")]
+    pub fn play_url(&self, url: impl AsRef<str>) -> Result<()> {
+        self.load_url(url)?;
+        self.play();
+        Ok(())
+    }
+
+    /// 从任意 `MediaSource`（字节流、内存 buffer 等）加载（**保持暂停**）。
+    ///
+    /// `hint_ext` 用于辅助探测格式，通常是文件扩展名，如 `Some("mp3")`。
+    pub fn load_source(&self, source: Box<dyn MediaSource>, hint_ext: Option<&str>) -> Result<()> {
+        self.load_source_inner(source, hint_ext, None)
+    }
+
+    /// 加载音源的核心实现。`interrupt` 仅 URL 播放用到。
+    fn load_source_inner(
+        &self,
         source: Box<dyn MediaSource>,
         hint_ext: Option<&str>,
         interrupt: Option<Arc<AtomicBool>>,
-    ) -> Result<Arc<Self>> {
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or(AudioError::NoOutputDevice)?;
-
+    ) -> Result<()> {
         // -- 探测格式 --
         let mut hint = Hint::new();
         if let Some(ext) = hint_ext {
@@ -402,72 +515,111 @@ impl Player {
             }
         }
 
-        // -- 选输出流配置：立体声 f32，优先解码采样率 --
-        let supported = device
-            .supported_output_configs()
-            .map_err(|e| AudioError::StreamConfig(format!("{e}")))?
-            .filter(|c| c.channels() == 2 && c.sample_format() == cpal::SampleFormat::F32)
-            .collect::<Vec<_>>();
-        let stream_config: StreamConfig = pick_stream_config(&supported, sample_rate)
-            .ok_or_else(|| {
-                AudioError::StreamConfig("no stereo f32 output config available".into())
-            })?
-            .into();
+        // -- 停掉旧的解码线程 + 输出流（换源）--
+        self.teardown();
 
-        // -- 共享状态 --
-        // 捕获缓冲：约 1 秒的立体声样本，读不及时新样本会覆盖旧的。
-        let capture_cap = (sample_rate as usize * 2).next_power_of_two();
-        let shared = Arc::new(Shared {
-            sample_rate,
-            channels: 2,
-            total_frames,
-            volume: AtomicU32::new(1.0f32.to_bits()),
-            pan: AtomicI8::new(0),
-            paused: AtomicBool::new(true),
-            eof: AtomicBool::new(false),
-            seeking: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
-            position_ns: AtomicU64::new(0),
-            ring: RingBuffer::with_capacity(DEFAULT_BUFFER_FRAMES * 2), // *2: 交错两声道
-            decode_pair: (Mutex::new(false), Condvar::new()),
-            interrupt: Mutex::new(interrupt),
-            eq: Equalizer::new(sample_rate),
-            eq_state: Mutex::new(EqState::new(2, EQ_BAND_FREQS.len())),
-            fade: FadeState::new(sample_rate),
-            capture_ring: Arc::new(RingBuffer::with_capacity(capture_cap)),
-            capture_enabled: AtomicBool::new(false),
-            metadata,
-            on_end: Mutex::new(None),
-        });
+        // -- 更新共享状态里的音源相关字段（用户设置跨源保留）--
+        self.shared.sample_rate.store(sample_rate, Ordering::Relaxed);
+        self.shared
+            .total_frames
+            .store(total_frames, Ordering::Relaxed);
+        *self.shared.metadata.lock().unwrap() = metadata;
+        *self.shared.interrupt.lock().unwrap() = interrupt;
 
-        // -- 命令通道 & 解码线程 --
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
-        let dec_shared = shared.clone();
-        let decoder_handle = thread::Builder::new()
-            .name("audio-lib-decode".into())
-            .spawn(move || run_decoder(dec_shared, cmd_rx, format, decoder, track_id))
-            .map_err(|e| AudioError::Thread(std::io::Error::other(e.to_string())))?;
+        // -- 复位播放进度（加载后处于暂停态）--
+        self.shared.paused.store(true, Ordering::Relaxed);
+        self.shared.eof.store(false, Ordering::Relaxed);
+        self.shared.finished.store(false, Ordering::Relaxed);
+        self.shared.seeking.store(false, Ordering::Relaxed);
+        self.shared.position_ns.store(0, Ordering::Relaxed);
+        self.shared.ring.clear();
+        // 采样率可能变：按新采样率重算均衡器系数（保留用户增益），
+        // 并重置滤波器历史，避免残留采样造成爆音。
+        self.shared.eq.set_sample_rate(sample_rate);
+        if let Ok(mut eq_state) = self.shared.eq_state.lock() {
+            eq_state.reset();
+        }
+        self.shared.fade.reset();
 
-        // -- 建立输出流 --
-        let cb_shared = shared.clone();
-        let stream = device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| audio_callback(data, &cb_shared),
-                move |_err| {
-                    // 输出流设备级错误（如设备被拔出）。留扩展点，目前忽略。
-                },
-                None,
-            )?;
+        // -- 建立输出流（按新采样率选配置）--
+        let stream = build_output_stream(&self.device, &self.shared, sample_rate)?;
         stream.play()?;
 
-        Ok(Arc::new(Self {
-            shared,
-            stream,
-            decoder: Mutex::new(Some(decoder_handle)),
-            cmd_tx,
-        }))
+        // -- 启动解码线程 --
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let dec_shared = self.shared.clone();
+        let dec_stop = stop.clone();
+        let decoder_handle = thread::Builder::new()
+            .name("audio-lib-decode".into())
+            .spawn(move || run_decoder(dec_shared, cmd_rx, format, decoder, track_id, dec_stop))
+            .map_err(|e| AudioError::Thread(std::io::Error::other(e.to_string())))?;
+
+        *self.inner.lock().unwrap() = PlayerRuntime {
+            stream: Some(stream),
+            decoder: Some(decoder_handle),
+            cmd_tx: Some(cmd_tx),
+            stop,
+        };
+
+        Ok(())
+    }
+
+    /// 停掉当前加载的解码线程并关闭输出流（换源前调用）。
+    ///
+    /// 置位当前解码线程的停止标记、唤醒可能 park 的线程、join，再 drop 输出流。
+    fn teardown(&self) {
+        let mut rt = self.inner.lock().unwrap();
+        rt.stop.store(true, Ordering::Relaxed);
+        // URL 播放：置位中断，打断可能阻塞在网络 read 上的解码线程，让 join 不卡。
+        if let Ok(guard) = self.shared.interrupt.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.store(true, Ordering::Relaxed);
+        }
+        self.shared.wake_decoder();
+        if let Some(handle) = rt.decoder.take() {
+            let _ = handle.join();
+        }
+        rt.cmd_tx = None;
+        // drop 输出流（先 pause 再 drop，回调随之停止）。
+        if let Some(stream) = rt.stream.take() {
+            let _ = stream.pause();
+            drop(stream);
+        }
+    }
+
+    // -- 向后兼容的便捷构造（new + load）-----------------------------------
+
+    /// 用默认输出设备打开一个音频文件并开始预解码（**保持暂停**）。
+    ///
+    /// 等价于 [`Player::new`] + [`Player::load_file`]。
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Arc<Self>> {
+        let player = Self::new()?;
+        player.load_file(path)?;
+        Ok(player)
+    }
+
+    /// 从任意 `MediaSource`（字节流、内存 buffer 等）打开（**保持暂停**）。
+    ///
+    /// `hint_ext` 用于辅助探测格式，通常是文件扩展名，如 `Some("mp3")`。
+    pub fn open_source(
+        source: Box<dyn MediaSource>,
+        hint_ext: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        let player = Self::new()?;
+        player.load_source(source, hint_ext)?;
+        Ok(player)
+    }
+
+    /// 打开一个 HTTP(S) 音频 URL 并开始流式预解码（**保持暂停**，需要 `url` feature）。
+    ///
+    /// 等价于 [`Player::new`] + [`Player::load_url`]。
+    #[cfg(feature = "url")]
+    pub fn open_url(url: impl AsRef<str>) -> Result<Arc<Self>> {
+        let player = Self::new()?;
+        player.load_url(url)?;
+        Ok(player)
     }
 
     // -- 传输控制 -----------------------------------------------------------
@@ -477,16 +629,22 @@ impl Player {
     /// 如果已播放结束，会自动回到文件头重新开始。
     /// 若配置了自动淡入（[`FadeState::set_fade_in`](crate::fade::FadeState::set_fade_in)），
     /// 恢复时音量会从 0 平滑拉起，避免爆音。
+    ///
+    /// 尚未加载音源时为空操作。
     pub fn play(&self) {
         if self.shared.finished.load(Ordering::Relaxed) {
             self.restart();
         }
         // 配了淡入就先开始淡变，再解除暂停；回调会按包络拉起音量。
-        if self.shared.fade.fade_in_samples() > 0 {
+        if self.shared.fade.fade_in_duration() > Duration::ZERO {
             self.shared.fade.start_fade_in();
         }
         self.shared.paused.store(false, Ordering::Relaxed);
-        let _ = self.stream.play();
+        if let Ok(rt) = self.inner.lock()
+            && let Some(stream) = rt.stream.as_ref()
+        {
+            let _ = stream.play();
+        }
     }
 
     /// 暂停播放。
@@ -495,17 +653,19 @@ impl Player {
     /// 会先让音量平滑降到 0 再真正暂停，避免切歌/暂停的咔哒声。
     /// 这个方法会阻塞到淡出完成（通常几十毫秒）；没配淡出则立即暂停。
     pub fn pause(&self) {
-        let fade_out = self.shared.fade.fade_out_samples();
-        if fade_out > 0 && !self.is_paused() {
-            let sr = self.sample_rate().max(1);
+        let fade_out = self.shared.fade.fade_out_duration();
+        if fade_out > Duration::ZERO && !self.is_paused() {
             self.shared.fade.start_fade_out();
             // 等淡变走完再暂停。回调按采样率推进 elapsed，这里按 wall-clock 等。
-            let wait = Duration::from_secs_f64(fade_out as f64 / sr as f64);
-            std::thread::sleep(wait + Duration::from_millis(5));
+            std::thread::sleep(fade_out + Duration::from_millis(5));
         }
         self.shared.paused.store(true, Ordering::Relaxed);
         self.shared.fade.cancel();
-        let _ = self.stream.pause();
+        if let Ok(rt) = self.inner.lock()
+            && let Some(stream) = rt.stream.as_ref()
+        {
+            let _ = stream.pause();
+        }
     }
 
     /// 暂停/播放切换，返回切换后是否在播放。
@@ -537,24 +697,37 @@ impl Player {
         self.shared.position_ns.store(0, Ordering::Relaxed);
         self.shared.ring.clear();
         self.shared.wake_decoder();
-        let _ = self.cmd_tx.send(Cmd::Restart);
+        if let Ok(rt) = self.inner.lock()
+            && let Some(tx) = rt.cmd_tx.as_ref()
+        {
+            let _ = tx.send(Cmd::Restart);
+        }
     }
 
     // -- 均衡器 / 淡变 / 标签 / 捕获 ----------------------------------------
 
-    /// 均衡器句柄。改增益 / 启停后回调下一个 block 生效。
-    pub fn eq(&self) -> &Equalizer {
-        &self.shared.eq
+    /// 均衡器句柄（自包含，可长期保存）。
+    ///
+    /// 返回的 `Equalizer` 共享底层系数和启停状态，保存一份随时调用
+    /// `set_band_gain` / `set_gains` / `set_enabled`，改动立即作用到播放中的均衡器。
+    /// 换源时均衡器按新采样率自动重算系数，句柄依然有效。
+    pub fn eq(&self) -> Equalizer {
+        self.shared.eq.clone()
     }
 
-    /// 淡入淡出句柄。可设自动淡入/淡出时长，或手动触发一次淡变。
-    pub fn fade(&self) -> &FadeState {
-        &self.shared.fade
+    /// 淡入淡出句柄（自包含，可长期保存）。
+    ///
+    /// 返回的 `FadeState` 共享底层淡变状态，保存一份随时调用
+    /// `set_fade_in` / `set_fade_out` / `start_fade_in` 等。
+    pub fn fade(&self) -> FadeState {
+        self.shared.fade.clone()
     }
 
-    /// 打开文件时提取的标签信息。容器没写标签时字段为 `None`。
-    pub fn metadata(&self) -> &TrackMetadata {
-        &self.shared.metadata
+    /// 打开音源时提取的标签信息（克隆一份，独立于 `Player` 生命周期）。
+    ///
+    /// 容器没写标签时字段为 `None`。换源后会更新为新一源的标签。
+    pub fn metadata(&self) -> TrackMetadata {
+        self.shared.metadata.lock().unwrap().clone()
     }
 
     /// 启用播放样本捕获，返回一个可读的环形缓冲句柄。
@@ -617,7 +790,11 @@ impl Player {
             handle.store(true, Ordering::Relaxed);
         }
         self.shared.wake_decoder();
-        let _ = self.cmd_tx.send(Cmd::Seek(abs));
+        if let Ok(rt) = self.inner.lock()
+            && let Some(tx) = rt.cmd_tx.as_ref()
+        {
+            let _ = tx.send(Cmd::Seek(abs));
+        }
     }
 
     // -- 状态查询 -----------------------------------------------------------
@@ -632,9 +809,9 @@ impl Player {
         self.shared.duration()
     }
 
-    /// 解码采样率。
+    /// 解码采样率。未加载音源时为 0。
     pub fn sample_rate(&self) -> u32 {
-        self.shared.sample_rate
+        self.shared.sample_rate()
     }
 
     /// 输出声道数。
@@ -685,22 +862,57 @@ impl Player {
 }
 
 // ---------------------------------------------------------------------------
+// 输出流构建
+// ---------------------------------------------------------------------------
+
+/// 用 `device` 建一个立体声 f32 输出流，优先匹配 `sample_rate`。
+fn build_output_stream(
+    device: &cpal::Device,
+    shared: &Arc<Shared>,
+    sample_rate: u32,
+) -> Result<Stream> {
+    let supported = device
+        .supported_output_configs()
+        .map_err(|e| AudioError::StreamConfig(format!("{e}")))?
+        .filter(|c| c.channels() == 2 && c.sample_format() == cpal::SampleFormat::F32)
+        .collect::<Vec<_>>();
+    let stream_config: StreamConfig = pick_stream_config(&supported, sample_rate)
+        .ok_or_else(|| AudioError::StreamConfig("no stereo f32 output config available".into()))?
+        .into();
+
+    let cb_shared = shared.clone();
+    let stream = device.build_output_stream(
+        &stream_config,
+        move |data: &mut [f32], _| audio_callback(data, &cb_shared),
+        move |_err| {
+            // 输出流设备级错误（如设备被拔出）。留扩展点，目前忽略。
+        },
+        None,
+    )?;
+    Ok(stream)
+}
+
+// ---------------------------------------------------------------------------
 // 解码线程
 // ---------------------------------------------------------------------------
 
 /// 解码线程主循环。
+///
+/// `stop` 是本线程的停止标记（换源 / Drop 时由控制线程置位）。
 fn run_decoder(
     shared: Arc<Shared>,
     cmd_rx: std::sync::mpsc::Receiver<Cmd>,
     mut format: Box<dyn FormatReader>,
     mut decoder: Box<dyn Decoder>,
     track_id: u32,
+    stop: Arc<AtomicBool>,
 ) {
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut scratch: Vec<f32> = Vec::new();
     let mut decode_finished = false;
 
-    loop {        if shared.stop.load(Ordering::Relaxed) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
             return;
         }
 
@@ -712,7 +924,7 @@ fn run_decoder(
         }
 
         if decode_finished {
-            park_decoder(&shared);
+            park_decoder(&shared, &stop);
             continue;
         }
 
@@ -727,8 +939,8 @@ fn run_decoder(
                 continue;
             }
             Err(_) => {
-                // URL Seek 会中断阻塞中的网络 read（ErrorKind::Interrupted），
-                // 这不是 EOF。清掉中断标记，短暂让出，回到循环顶部处理待处理的 Seek 命令。
+                // URL Seek / 换源会中断阻塞中的网络 read（ErrorKind::Interrupted），
+                // 这不是 EOF。清掉中断标记，短暂让出，回到循环顶部处理待处理的命令。
                 let interrupted = shared
                     .interrupt
                     .lock()
@@ -772,17 +984,15 @@ fn run_decoder(
             continue;
         }
 
-        // 推入环形缓冲，满了 park（可被 Seek/Drop 唤醒）
+        // 推入环形缓冲，满了 park（可被 Seek/Drop/换源 唤醒）
         let mut offset = 0;
         while offset < scratch.len() {
-            if shared.stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
                 return;
             }
             let written = shared.ring.push(&scratch[offset..]);
             offset += written;
-            if written == 0
-                && park_decoder(&shared)
-            {
+            if written == 0 && park_decoder(&shared, &stop) {
                 // 被唤醒且可能收到了命令，回到外层处理
                 break;
             }
@@ -836,9 +1046,11 @@ fn do_seek(shared: &Shared, format: &mut Box<dyn FormatReader>, track_id: u32, t
     shared.fade.reset();
 }
 
-/// park 解码线程一段时间，或直到被唤醒（Seek/Drop）。返回是否被提前唤醒。
-fn park_decoder(shared: &Shared) -> bool {
-    if shared.stop.load(Ordering::Relaxed) {
+/// park 解码线程一段时间，或直到被唤醒（Seek/Drop/换源）。返回是否被提前唤醒。
+///
+/// `stop` 是本解码线程的停止标记，置位时不 park（让外层循环退出）。
+fn park_decoder(shared: &Shared, stop: &AtomicBool) -> bool {
+    if stop.load(Ordering::Relaxed) {
         return false;
     }
     let (mutex, cv) = &shared.decode_pair;
@@ -927,6 +1139,7 @@ fn audio_callback(out: &mut [f32], shared: &Shared) {
     let channels = shared.channels.max(1);
     let frames = out.len() / channels;
     let want = frames * channels;
+    let sample_rate = shared.sample_rate();
 
     // 栈上临时缓冲；CPAL 回调通常每块几百~几千采样，4096 足够。
     // 超出时按 4096 分批（罕见）。
@@ -953,7 +1166,7 @@ fn audio_callback(out: &mut [f32], shared: &Shared) {
     }
 
     // -- 淡入淡出：按包络给每个采样乘增益 --
-    shared.fade.process_interleaved(&mut tmp[..got], channels);
+    shared.fade.process_interleaved(&mut tmp[..got], channels, sample_rate);
 
     let volume = shared.volume_f32();
     let pan = shared.pan_f32();
@@ -982,8 +1195,8 @@ fn audio_callback(out: &mut [f32], shared: &Shared) {
     }
 
     // 按实际消费的帧数推进绝对位置（纳秒）。
-    if shared.sample_rate > 0 {
-        let advance_ns = (frames_got as u128 * 1_000_000_000u128) / shared.sample_rate as u128;
+    if sample_rate > 0 {
+        let advance_ns = (frames_got as u128 * 1_000_000_000u128) / sample_rate as u128;
         shared
             .position_ns
             .fetch_add(advance_ns as u64, Ordering::Relaxed);

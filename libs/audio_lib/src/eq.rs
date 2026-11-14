@@ -29,7 +29,7 @@
 //! 所有系数最后除以 `a0` 归一化（`a0 = 1`），回调里少一次除法。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
@@ -136,33 +136,32 @@ impl BiquadState {
 /// 一组滤波器系数（每段一个）。回调里按声道各持有独立状态。
 type Coeffs = Arc<[Biquad]>;
 
-/// 参数均衡器。
-///
-/// 克隆共享同一份系数（`ArcSwap`），控制线程改增益后回调立即生效。
-/// 每个声道需要独立状态，由回调侧持有（见 [`EqState`]）。
-pub struct Equalizer {
-    /// 当前系数快照。控制线程 `store`，回调 `load`，无锁。
-    coeffs: Arc<ArcSwap<Coeffs>>,
-    /// 是否启用。关闭时回调直接跳过滤波（省 CPU）。
-    enabled: AtomicBool,
-    /// 解码采样率，重算系数时复用。
+/// 均衡器的可调参数（增益 + 采样率 + Q）。控制线程读写，换采样率或改增益时重算系数。
+#[derive(Clone)]
+struct EqParams {
+    /// 当前采样率。换源时可能变化，需据此重算全部系数。
     sample_rate: u32,
     /// 每段 Q 值。
     q: f32,
-    /// 段数。
-    bands: usize,
+    /// 每段增益（dB）。保存下来，采样率变化时据此重建系数。
+    gains: Vec<f32>,
 }
 
-impl Clone for Equalizer {
-    fn clone(&self) -> Self {
-        Self {
-            coeffs: self.coeffs.clone(),
-            enabled: AtomicBool::new(self.enabled.load(Ordering::Relaxed)),
-            sample_rate: self.sample_rate,
-            q: self.q,
-            bands: self.bands,
-        }
-    }
+/// 参数均衡器。
+///
+/// 这是个**自包含句柄**：克隆共享同一份系数、启停状态和参数（都走 `Arc`），
+/// 保存一份随时调用方法，改动立即作用到正在播放的均衡器。
+/// 每个声道需要独立滤波器状态，由回调侧持有（见 [`EqState`]）。
+#[derive(Clone)]
+pub struct Equalizer {
+    /// 当前系数快照。控制线程 `store`，回调 `load`，无锁。
+    coeffs: Arc<ArcSwap<Coeffs>>,
+    /// 是否启用。关闭时回调直接跳过滤波（省 CPU）。Arc 共享，克隆句柄控制同一状态。
+    enabled: Arc<AtomicBool>,
+    /// 可调参数（增益/采样率/Q）。`Mutex` 保护，只在控制线程改；换采样率时重算系数。
+    params: Arc<Mutex<EqParams>>,
+    /// 段数。
+    bands: usize,
 }
 
 impl Equalizer {
@@ -174,53 +173,88 @@ impl Equalizer {
     /// 用给定的各段增益（dB）创建均衡器。`gains_db` 不足 10 段的部分补 0。
     pub fn with_gains(sample_rate: u32, gains_db: &[f32]) -> Self {
         let bands = EQ_BAND_FREQS.len();
-        let coeffs: Vec<Biquad> = EQ_BAND_FREQS
-            .iter()
-            .enumerate()
-            .map(|(i, &f)| {
-                let g = gains_db.get(i).copied().unwrap_or(0.0);
-                Biquad::peaking(f, g, sample_rate as f32, DEFAULT_EQ_Q)
-            })
+        let gains: Vec<f32> = (0..bands)
+            .map(|i| gains_db.get(i).copied().unwrap_or(0.0))
             .collect();
+        let coeffs = Self::build_coeffs(&EQ_BAND_FREQS, &gains, sample_rate, DEFAULT_EQ_Q);
         Self {
-            coeffs: Arc::new(ArcSwap::from_pointee(Arc::from(coeffs.into_boxed_slice()))),
-            enabled: AtomicBool::new(true),
-            sample_rate,
-            q: DEFAULT_EQ_Q,
+            coeffs: Arc::new(ArcSwap::from_pointee(coeffs)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            params: Arc::new(Mutex::new(EqParams {
+                sample_rate,
+                q: DEFAULT_EQ_Q,
+                gains,
+            })),
             bands,
         }
     }
 
+    /// 根据频率表 + 增益 + 采样率 + Q 构建一整组系数。
+    fn build_coeffs(freqs: &[f32], gains: &[f32], sample_rate: u32, q: f32) -> Coeffs {
+        let coeffs: Vec<Biquad> = freqs
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| {
+                let g = gains.get(i).copied().unwrap_or(0.0);
+                Biquad::peaking(f, g, sample_rate as f32, q)
+            })
+            .collect();
+        Arc::from(coeffs.into_boxed_slice())
+    }
+
     /// 设置某一段的增益（dB）。`band` 越界则忽略。
     ///
-    /// 重算该段系数并原子换入（微秒级），回调侧下一个 block 生效。
+    /// 更新保存的增益并重算该段系数，原子换入（微秒级），回调侧下一个 block 生效。
     /// 段间是级联的，改一段只影响该段的响应，其余段系数保持不变。
     pub fn set_band_gain(&self, band: usize, gain_db: f32) {
         if band >= self.bands {
             return;
         }
+        // 更新参数里保存的增益，再用当前采样率重算该段系数。
+        let (gains, sample_rate, q) = {
+            let Ok(mut p) = self.params.lock() else {
+                return;
+            };
+            p.gains[band] = gain_db;
+            (p.gains.clone(), p.sample_rate, p.q)
+        };
         let old = self.coeffs.load();
         let mut new: Vec<Biquad> = old.iter().copied().collect();
-        new[band] = Biquad::peaking(
-            EQ_BAND_FREQS[band],
-            gain_db,
-            self.sample_rate as f32,
-            self.q,
-        );
+        new[band] = Biquad::peaking(EQ_BAND_FREQS[band], gains[band], sample_rate as f32, q);
         self.coeffs.store(Arc::new(Arc::from(new.into_boxed_slice())));
     }
 
     /// 一次性设置所有段增益（dB）。长度不足补 0，超出忽略。
     pub fn set_gains(&self, gains_db: &[f32]) {
-        let coeffs: Vec<Biquad> = EQ_BAND_FREQS
-            .iter()
-            .enumerate()
-            .map(|(i, &f)| {
-                let g = gains_db.get(i).copied().unwrap_or(0.0);
-                Biquad::peaking(f, g, self.sample_rate as f32, self.q)
-            })
-            .collect();
-        self.coeffs.store(Arc::new(Arc::from(coeffs.into_boxed_slice())));
+        let (gains, sample_rate, q) = {
+            let Ok(mut p) = self.params.lock() else {
+                return;
+            };
+            for (i, g) in gains_db.iter().enumerate().take(self.bands) {
+                p.gains[i] = *g;
+            }
+            (p.gains.clone(), p.sample_rate, p.q)
+        };
+        let coeffs = Self::build_coeffs(&EQ_BAND_FREQS, &gains, sample_rate, q);
+        self.coeffs.store(Arc::new(coeffs));
+    }
+
+    /// 采样率变化时调用（换源）。保留当前各段增益，按新采样率重算全部系数。
+    pub fn set_sample_rate(&self, sample_rate: u32) {
+        let (gains, q) = {
+            let Ok(mut p) = self.params.lock() else {
+                return;
+            };
+            p.sample_rate = sample_rate;
+            (p.gains.clone(), p.q)
+        };
+        let coeffs = Self::build_coeffs(&EQ_BAND_FREQS, &gains, sample_rate, q);
+        self.coeffs.store(Arc::new(coeffs));
+    }
+
+    /// 当前采样率（重算系数用）。
+    pub fn sample_rate(&self) -> u32 {
+        self.params.lock().map(|p| p.sample_rate).unwrap_or(0)
     }
 
     /// 启用/禁用均衡器。禁用时回调跳过滤波。
@@ -241,6 +275,13 @@ impl Equalizer {
     /// 第 `band` 段的中心频率（Hz）。
     pub fn band_freq(&self, band: usize) -> Option<f32> {
         EQ_BAND_FREQS.get(band).copied()
+    }
+
+    /// 第 `band` 段当前配置的增益（dB）。`band` 越界返回 `None`。
+    ///
+    /// 这是保存的增益值，换源（采样率变化）后依然保留。
+    pub fn band_gain(&self, band: usize) -> Option<f32> {
+        self.params.lock().ok()?.gains.get(band).copied()
     }
 
     /// 当前系数快照（音频回调用）。也可用于检查实际生效的滤波器系数。

@@ -152,15 +152,15 @@ fn fade_state_gain_ramp() {
 
     let sr = 1000u32;
     let fade = FadeState::new(sr);
-    fade.set_fade_in(Duration::from_secs_f64(0.1), sr); // 100 采样
-    fade.set_fade_out(Duration::from_secs_f64(0.1), sr);
-    assert_eq!(fade.fade_in_samples(), 100);
-    assert_eq!(fade.fade_out_samples(), 100);
+    fade.set_fade_in(Duration::from_secs_f64(0.1)); // 100ms @ 1000Hz = 100 采样
+    fade.set_fade_out(Duration::from_secs_f64(0.1));
+    assert_eq!(fade.fade_in_samples(sr), 100);
+    assert_eq!(fade.fade_out_samples(sr), 100);
 
     // 淡入：起始增益接近 0，末端接近 1。
     fade.start_fade_in();
     let mut buf: Vec<f32> = vec![1.0; 200];
-    fade.process_interleaved(&mut buf, 1);
+    fade.process_interleaved(&mut buf, 1, sr);
     assert!(buf[0] < 0.2, "淡入首采样应接近 0，实际 {}", buf[0]);
     assert!(
         (buf[99] - 1.0).abs() < 0.05 || buf[99] > 0.8,
@@ -172,7 +172,7 @@ fn fade_state_gain_ramp() {
     // 淡出：起始接近 1，末端为 0，且走完后剩余清零。
     fade.start_fade_out();
     let mut buf2 = vec![1.0f32; 200];
-    fade.process_interleaved(&mut buf2, 1);
+    fade.process_interleaved(&mut buf2, 1, sr);
     assert!(buf2[0] > 0.8, "淡出首采样应接近 1，实际 {}", buf2[0]);
     assert!(buf2[99].abs() < 0.05, "淡出末端应接近 0，实际 {}", buf2[99]);
     assert!(
@@ -183,10 +183,10 @@ fn fade_state_gain_ramp() {
 
     // 时长为 0 的淡变应立即结束，不改数据。
     let f0 = FadeState::new(sr);
-    f0.set_fade_in(Duration::ZERO, sr);
+    f0.set_fade_in(Duration::ZERO);
     f0.start_fade_in();
     let mut buf3 = vec![1.0f32; 10];
-    f0.process_interleaved(&mut buf3, 1);
+    f0.process_interleaved(&mut buf3, 1, sr);
     assert!(
         buf3.iter().all(|&x| (x - 1.0).abs() < 1e-6),
         "0 时长淡入不应改数据"
@@ -199,11 +199,11 @@ fn fade_interleaved_stereo() {
     use audio_lib::FadeState;
     let sr = 1000u32;
     let fade = FadeState::new(sr);
-    fade.set_fade_in(Duration::from_secs_f64(0.05), sr); // 50 采样 = 25 帧
+    fade.set_fade_in(Duration::from_secs_f64(0.05)); // 50ms @ 1000Hz = 50 采样 = 25 帧
     fade.start_fade_in();
     // 交错立体声：L R L R ...
     let mut buf: Vec<f32> = vec![1.0; 200];
-    fade.process_interleaved(&mut buf, 2);
+    fade.process_interleaved(&mut buf, 2, sr);
     // 帧间隔均匀衰减，L/R 同帧应同增益。
     let g0 = buf[0];
     let g1 = buf[1];
@@ -316,5 +316,52 @@ fn metadata_accessor_on_player() {
     // 纯 WAV 没有标题/艺术家标签，字段应为 None（但访问不 panic）。
     let m = player.metadata();
     assert!(m.title.is_none() || m.title.is_some());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn saved_handles_control_live_state() {
+    if !cpal::default_host().default_output_device().is_some() {
+        eprintln!("跳过：无默认输出设备");
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let path = dir.join("audio_lib_test_handle.wav");
+    let _ = make_wav(&path, 44_100, 2.0);
+
+    let player = Player::open(&path).expect("open");
+
+    // 把句柄保存起来（脱离 player 借用），之后只通过句柄调用方法。
+    let eq: audio_lib::Equalizer = player.eq();
+    let fade: audio_lib::FadeState = player.fade();
+    let meta: audio_lib::TrackMetadata = player.metadata();
+
+    // EQ 句柄改增益 / 启停，应作用到播放中的均衡器（共享同一份状态）。
+    eq.set_band_gain(5, 6.0);
+    eq.set_enabled(false);
+    assert!(!player.eq().is_enabled(), "句柄禁用应反映到 player");
+    assert!(!eq.is_enabled());
+    // player 侧再开启，句柄也应看到（共享状态）。
+    player.eq().set_enabled(true);
+    assert!(eq.is_enabled(), "player 开启应反映到句柄");
+
+    // 淡变句柄设自动淡入时长，应共享同一份状态。
+    fade.set_fade_in(Duration::from_millis(250));
+    let sr = player.sample_rate();
+    assert_eq!(
+        player.fade().fade_in_samples(sr),
+        fade.fade_in_samples(sr),
+        "句柄和 player 应共享淡入配置"
+    );
+    assert_eq!(fade.fade_in_samples(44_100), 44_100 * 250 / 1000);
+
+    // 标签句柄是独立克隆，访问安全。
+    let _ = meta.title;
+
+    // 克隆句柄之间也共享状态。
+    let eq2 = eq.clone();
+    eq2.set_band_gain(0, 3.0);
+    assert_eq!(player.eq().band_freq(0), Some(31.0));
+
     let _ = std::fs::remove_file(&path);
 }

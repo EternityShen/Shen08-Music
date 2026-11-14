@@ -3,6 +3,10 @@
 //!
 //! 服务器只用 std::net 手写，避免额外依赖，也能离线跑。
 
+// 整个文件依赖 `url` feature（HttpSource / load_url）。关掉该 feature 时不编译，
+// 这样 `cargo test --no-default-features --all-targets` 也能通过。
+#![cfg(feature = "url")]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

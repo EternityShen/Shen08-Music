@@ -15,6 +15,7 @@
 //!   可用于自定义过渡逻辑。
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 淡变模式。存成 u32 以便用原子。
@@ -40,97 +41,129 @@ impl FadeMode {
 }
 
 /// 淡变包络状态。回调按帧推进 `elapsed`，算出当前增益乘上去。
-#[derive(Debug, Default)]
+///
+/// 这是个**自包含句柄**：内部状态走 `Arc`，克隆出的句柄共享同一份淡变状态。
+/// 保存一份，随时调用 `set_fade_in` / `start_fade_out` 等，立即作用到播放中的淡变。
+#[derive(Clone, Debug, Default)]
 pub struct FadeState {
+    inner: Arc<FadeInner>,
+}
+
+#[derive(Debug, Default)]
+struct FadeInner {
     /// 当前模式（`FadeMode` as u32）。
     mode: AtomicU32,
     /// 本次淡变已经过多少**采样**（含历史，跨回调块累加）。
     elapsed: AtomicU64,
-    /// 淡入时长（采样数）。
-    fade_in_samples: AtomicU64,
-    /// 淡出时长（采样数）。
-    fade_out_samples: AtomicU64,
+    /// 淡入时长。存 `Duration`（纳秒），按当前采样率换算成采样数，
+    /// 这样换源（采样率变化）后淡变时长依然按 wall-clock 生效。
+    fade_in: AtomicU64,
+    /// 淡出时长（纳秒）。
+    fade_out: AtomicU64,
 }
 
 impl FadeState {
-    /// 创建一个无淡变的状态。`sample_rate` 保留以备将来按采样率换算，当前未用。
+    /// 创建一个无淡变的状态。
     pub fn new(_sample_rate: u32) -> Self {
         Self {
-            mode: AtomicU32::new(FadeMode::None as u32),
-            elapsed: AtomicU64::new(0),
-            fade_in_samples: AtomicU64::new(0),
-            fade_out_samples: AtomicU64::new(0),
+            inner: Arc::new(FadeInner {
+                mode: AtomicU32::new(FadeMode::None as u32),
+                elapsed: AtomicU64::new(0),
+                fade_in: AtomicU64::new(0),
+                fade_out: AtomicU64::new(0),
+            }),
         }
     }
 
     // -- 配置（控制线程调用）--
 
-    /// 设置自动淡入时长。0 表示不淡入。
-    pub fn set_fade_in(&self, duration: Duration, sample_rate: u32) {
-        let n = duration.as_secs_f64() * sample_rate as f64;
-        self.fade_in_samples.store(n as u64, Ordering::Relaxed);
+    /// 设置自动淡入时长。`Duration::ZERO` 表示不淡入。
+    ///
+    /// 时长按 wall-clock 存储，换源（采样率变化）后依然准确。
+    pub fn set_fade_in(&self, duration: Duration) {
+        self.inner
+            .fade_in
+            .store(duration.as_nanos() as u64, Ordering::Relaxed);
     }
 
-    /// 设置自动淡出时长。0 表示不淡出。
-    pub fn set_fade_out(&self, duration: Duration, sample_rate: u32) {
-        let n = duration.as_secs_f64() * sample_rate as f64;
-        self.fade_out_samples.store(n as u64, Ordering::Relaxed);
+    /// 设置自动淡出时长。`Duration::ZERO` 表示不淡出。
+    pub fn set_fade_out(&self, duration: Duration) {
+        self.inner
+            .fade_out
+            .store(duration.as_nanos() as u64, Ordering::Relaxed);
     }
 
-    /// 当前配置的自动淡入时长（采样数）。
-    pub fn fade_in_samples(&self) -> u64 {
-        self.fade_in_samples.load(Ordering::Relaxed)
+    /// 当前配置的自动淡入时长。
+    pub fn fade_in_duration(&self) -> Duration {
+        Duration::from_nanos(self.inner.fade_in.load(Ordering::Relaxed))
     }
 
-    /// 当前配置的自动淡出时长（采样数）。
-    pub fn fade_out_samples(&self) -> u64 {
-        self.fade_out_samples.load(Ordering::Relaxed)
+    /// 当前配置的自动淡出时长。
+    pub fn fade_out_duration(&self) -> Duration {
+        Duration::from_nanos(self.inner.fade_out.load(Ordering::Relaxed))
+    }
+
+    /// 当前配置的自动淡入时长换算成采样数（按给定采样率）。
+    pub fn fade_in_samples(&self, sample_rate: u32) -> u64 {
+        (self.fade_in_duration().as_secs_f64() * sample_rate as f64) as u64
+    }
+
+    /// 当前配置的自动淡出时长换算成采样数（按给定采样率）。
+    pub fn fade_out_samples(&self, sample_rate: u32) -> u64 {
+        (self.fade_out_duration().as_secs_f64() * sample_rate as f64) as u64
     }
 
     // -- 触发（控制线程调用）--
 
     /// 立即开始一次淡入（从当前音量 0 拉到 1）。
     pub fn start_fade_in(&self) {
-        self.elapsed.store(0, Ordering::Relaxed);
-        self.mode.store(FadeMode::In as u32, Ordering::Relaxed);
+        self.inner.elapsed.store(0, Ordering::Relaxed);
+        self.inner.mode.store(FadeMode::In as u32, Ordering::Relaxed);
     }
 
     /// 立即开始一次淡出（从当前音量 1 降到 0）。
     pub fn start_fade_out(&self) {
-        self.elapsed.store(0, Ordering::Relaxed);
-        self.mode.store(FadeMode::Out as u32, Ordering::Relaxed);
+        self.inner.elapsed.store(0, Ordering::Relaxed);
+        self.inner.mode.store(FadeMode::Out as u32, Ordering::Relaxed);
     }
 
     /// 取消进行中的淡变，恢复直通。
     pub fn cancel(&self) {
-        self.mode.store(FadeMode::None as u32, Ordering::Relaxed);
+        self.inner.mode.store(FadeMode::None as u32, Ordering::Relaxed);
     }
 
     // -- 回调（音频线程调用）--
 
-    /// 对 `interleaved` 里每帧计算增益并乘上。`n_channels` 为交错声道数。
+    /// 对 `interleaved` 里每帧计算增益并乘上。`n_channels` 为交错声道数，
+    /// `sample_rate` 用于把配置的时长换算成采样数（换源后采样率可能变）。
     ///
     /// 淡变走完后自动切回 [`FadeMode::None`]（增益 1），不额外处理。
     #[inline]
-    pub fn process_interleaved(&self, interleaved: &mut [f32], n_channels: usize) {
-        let mode = FadeMode::from_u32(self.mode.load(Ordering::Relaxed));
+    pub fn process_interleaved(&self, interleaved: &mut [f32], n_channels: usize, sample_rate: u32) {
+        let mode = FadeMode::from_u32(self.inner.mode.load(Ordering::Relaxed));
         if mode == FadeMode::None {
             return;
         }
         let n_ch = n_channels.max(1);
         let frames = interleaved.len() / n_ch;
-        let mut elapsed = self.elapsed.load(Ordering::Relaxed);
+        let mut elapsed = self.inner.elapsed.load(Ordering::Relaxed);
 
-        // 本次淡变总时长（采样数）。
+        // 本次淡变总时长：把配置的 wall-clock 时长按当前采样率换算成采样数。
         let total = match mode {
-            FadeMode::In => self.fade_in_samples.load(Ordering::Relaxed),
-            FadeMode::Out => self.fade_out_samples.load(Ordering::Relaxed),
+            FadeMode::In => {
+                (self.inner.fade_in.load(Ordering::Relaxed) as f64 * sample_rate as f64
+                    / 1_000_000_000.0) as u64
+            }
+            FadeMode::Out => {
+                (self.inner.fade_out.load(Ordering::Relaxed) as f64 * sample_rate as f64
+                    / 1_000_000_000.0) as u64
+            }
             FadeMode::None => unreachable!(),
         };
 
         if total == 0 {
             // 时长为 0 的淡变没有意义，直接结束。
-            self.mode.store(FadeMode::None as u32, Ordering::Relaxed);
+            self.inner.mode.store(FadeMode::None as u32, Ordering::Relaxed);
             return;
         }
 
@@ -157,22 +190,22 @@ impl FadeState {
                     let start = (frame + 1) * n_ch;
                     interleaved[start..frames * n_ch].fill(0.0);
                 }
-                self.mode.store(FadeMode::None as u32, Ordering::Relaxed);
-                self.elapsed.store(0, Ordering::Relaxed);
+                self.inner.mode.store(FadeMode::None as u32, Ordering::Relaxed);
+                self.inner.elapsed.store(0, Ordering::Relaxed);
                 return;
             }
         }
-        self.elapsed.store(elapsed, Ordering::Relaxed);
+        self.inner.elapsed.store(elapsed, Ordering::Relaxed);
     }
 
     /// 当前是否在淡变中。
     pub fn is_fading(&self) -> bool {
-        FadeMode::from_u32(self.mode.load(Ordering::Relaxed)) != FadeMode::None
+        FadeMode::from_u32(self.inner.mode.load(Ordering::Relaxed)) != FadeMode::None
     }
 
     /// Seek / 换歌时重置，取消进行中的淡变。
     pub fn reset(&self) {
-        self.mode.store(FadeMode::None as u32, Ordering::Relaxed);
-        self.elapsed.store(0, Ordering::Relaxed);
+        self.inner.mode.store(FadeMode::None as u32, Ordering::Relaxed);
+        self.inner.elapsed.store(0, Ordering::Relaxed);
     }
 }

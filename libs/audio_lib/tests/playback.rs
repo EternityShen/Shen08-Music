@@ -133,3 +133,58 @@ fn full_pipeline_play_pause_seek() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// 裸句柄两步式用法：`Player::new()` 建空句柄，再 `load_file` / `play_file` 加载。
+/// 并验证换源（不同采样率）时保存的句柄依然有效、EQ 按新采样率重算、用户设置跨源保留。
+#[test]
+fn bare_handle_and_cross_source_reload() {
+    if !has_output_device() {
+        eprintln!("跳过：无默认输出设备");
+        return;
+    }
+
+    let dir = std::env::temp_dir();
+    let path_44k = dir.join("audio_lib_test_reload_44k.wav");
+    let path_48k = dir.join("audio_lib_test_reload_48k.wav");
+    make_wav(&path_44k, 44_100, 2.0);
+    make_wav(&path_48k, 48_000, 2.0);
+
+    // 两步式：先建空句柄（未加载，采样率为 0），再加载。
+    let player = Player::new().expect("new");
+    assert_eq!(player.sample_rate(), 0, "未加载时采样率应为 0");
+    assert!(player.is_paused(), "未加载时处于暂停态");
+    assert_eq!(player.duration(), None, "未加载无总时长");
+
+    // 加载前就能配置用户设置（这些跨源保留）。
+    let eq = player.eq();
+    let fade = player.fade();
+    eq.set_band_gain(5, 6.0);
+    fade.set_fade_in(Duration::from_millis(100));
+
+    // 加载第一个源（44.1kHz），保持暂停。
+    player.load_file(&path_44k).expect("load 44k");
+    assert_eq!(player.sample_rate(), 44_100);
+    assert!(player.is_paused(), "加载后应保持暂停");
+    assert!(player.duration().is_some());
+
+    // 加载前设置的 EQ 增益在加载后依然生效（跨源保留）。
+    assert!(eq.is_enabled());
+    assert_eq!(eq.band_gain(5), Some(6.0), "EQ 增益应跨源保留");
+
+    // 换到第二个源（48kHz）：采样率变，EQ 应按新采样率重算，增益保留。
+    player.load_file(&path_48k).expect("load 48k");
+    assert_eq!(player.sample_rate(), 48_000);
+    assert_eq!(eq.sample_rate(), 48_000, "EQ 应感知新采样率");
+    assert_eq!(eq.band_gain(5), Some(6.0), "换源后增益应保留");
+    assert!((fade.fade_in_duration() - Duration::from_millis(100)).is_zero());
+
+    // 换源后 play_file 立即播放（加载 + 播放一步到位）。
+    player.play_file(&path_44k).expect("play 44k");
+    assert!(!player.is_paused(), "play_file 后应在播放");
+    assert_eq!(player.sample_rate(), 44_100);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(player.position() > Duration::ZERO, "play_file 应真正发声前进了位置");
+
+    let _ = std::fs::remove_file(&path_44k);
+    let _ = std::fs::remove_file(&path_48k);
+}
