@@ -6362,6 +6362,7 @@ dependencies = [
 name = "shen08_music"
 version = "0.1.0"
 dependencies = [
+ "audio_lib",
  "dirs 7.0.0",
  "gpui-kit",
  "gpui-pre-reqwest",
