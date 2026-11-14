@@ -8,4 +8,6 @@ version = "0.1.0"
 
 [workspace.dependencies]
 toml = "1.2.1+spec-1.1.0"
-serde = { version = "1.0.229" , features = ["derive"]}
+serde = { version = "1.0.229", features = ["derive"] }
+kgmusic_api = { path = "/home/shen/Work/kgmusic_api" }
+dirs = "7.0.0"

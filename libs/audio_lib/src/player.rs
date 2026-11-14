@@ -32,6 +32,10 @@ use crate::ring_buffer::RingBuffer;
 #[cfg(feature = "url")]
 use crate::http_source::HttpSource;
 
+use crate::eq::{EqState, Equalizer, EQ_BAND_FREQS};
+use crate::fade::FadeState;
+use crate::metadata::TrackMetadata;
+
 /// 解码线程在环形缓冲里攒够多少**帧**后开始退避（约 1.4 秒 @48kHz）。
 const DEFAULT_BUFFER_FRAMES: usize = 1 << 16;
 /// 缓冲满时退避/ park 的超时时长。也用作命令轮询间隔。
@@ -203,6 +207,26 @@ struct Shared {
     /// 让它赶紧回到循环处理 Seek 命令。本地文件为 None（读不会阻塞）。
     pub(crate) interrupt: Mutex<Option<Arc<AtomicBool>>>,
 
+    // -- 均衡器 --
+    /// 均衡器参数（系数用 ArcSwap 原子换入）。控制线程改，回调无锁读。
+    eq: Equalizer,
+    /// 均衡器各声道滤波器状态。只有音频回调读写，锁几乎无竞争。
+    eq_state: Mutex<EqState>,
+
+    // -- 淡入淡出 --
+    /// 淡变包络状态（内部全原子，回调无锁读）。
+    fade: FadeState,
+
+    // -- 播放样本捕获 --
+    /// 捕获环形缓冲（第二个 SPSC tap）。回调是生产者，`read_capture` 是消费者。
+    capture_ring: Arc<RingBuffer>,
+    /// 是否启用捕获。关闭时回调跳过 push，零开销。
+    capture_enabled: AtomicBool,
+
+    // -- 标签信息 --
+    /// 打开文件时提取的标签，只读。
+    metadata: TrackMetadata,
+
     // -- 结束回调 --
     /// 播放结束回调。用 Mutex<Option> 让音频回调能安全取走克隆。
     on_end: Mutex<Option<NotifyCallback>>,
@@ -353,7 +377,7 @@ impl Player {
             &FormatOptions::default(),
             &MetadataOptions::default(),
         );
-        let format = match probed {
+        let mut format = match probed {
             Ok(p) => p.format,
             Err(e) => return Err(AudioError::Probe(format!("{e}"))),
         };
@@ -368,6 +392,16 @@ impl Player {
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())?;
 
+        // -- 提取标签信息 --
+        // 必须在把 format 移进解码线程之前读，否则拿不到 MetadataLog。
+        let mut metadata = TrackMetadata::default();
+        {
+            let log = format.metadata();
+            if let Some(rev) = log.current() {
+                metadata = TrackMetadata::from_tags(rev.tags());
+            }
+        }
+
         // -- 选输出流配置：立体声 f32，优先解码采样率 --
         let supported = device
             .supported_output_configs()
@@ -381,6 +415,8 @@ impl Player {
             .into();
 
         // -- 共享状态 --
+        // 捕获缓冲：约 1 秒的立体声样本，读不及时新样本会覆盖旧的。
+        let capture_cap = (sample_rate as usize * 2).next_power_of_two();
         let shared = Arc::new(Shared {
             sample_rate,
             channels: 2,
@@ -396,6 +432,12 @@ impl Player {
             ring: RingBuffer::with_capacity(DEFAULT_BUFFER_FRAMES * 2), // *2: 交错两声道
             decode_pair: (Mutex::new(false), Condvar::new()),
             interrupt: Mutex::new(interrupt),
+            eq: Equalizer::new(sample_rate),
+            eq_state: Mutex::new(EqState::new(2, EQ_BAND_FREQS.len())),
+            fade: FadeState::new(sample_rate),
+            capture_ring: Arc::new(RingBuffer::with_capacity(capture_cap)),
+            capture_enabled: AtomicBool::new(false),
+            metadata,
             on_end: Mutex::new(None),
         });
 
@@ -433,17 +475,37 @@ impl Player {
     /// 开始播放 / 从暂停恢复。
     ///
     /// 如果已播放结束，会自动回到文件头重新开始。
+    /// 若配置了自动淡入（[`FadeState::set_fade_in`](crate::fade::FadeState::set_fade_in)），
+    /// 恢复时音量会从 0 平滑拉起，避免爆音。
     pub fn play(&self) {
         if self.shared.finished.load(Ordering::Relaxed) {
             self.restart();
+        }
+        // 配了淡入就先开始淡变，再解除暂停；回调会按包络拉起音量。
+        if self.shared.fade.fade_in_samples() > 0 {
+            self.shared.fade.start_fade_in();
         }
         self.shared.paused.store(false, Ordering::Relaxed);
         let _ = self.stream.play();
     }
 
-    /// 暂停播放。音频回调会输出静音且不再消费缓冲。
+    /// 暂停播放。
+    ///
+    /// 若配置了自动淡出（[`FadeState::set_fade_out`](crate::fade::FadeState::set_fade_out)），
+    /// 会先让音量平滑降到 0 再真正暂停，避免切歌/暂停的咔哒声。
+    /// 这个方法会阻塞到淡出完成（通常几十毫秒）；没配淡出则立即暂停。
     pub fn pause(&self) {
+        let fade_out = self.shared.fade.fade_out_samples();
+        if fade_out > 0 && !self.is_paused() {
+            let sr = self.sample_rate().max(1);
+            self.shared.fade.start_fade_out();
+            // 等淡变走完再暂停。回调按采样率推进 elapsed，这里按 wall-clock 等。
+            let wait = Duration::from_secs_f64(fade_out as f64 / sr as f64);
+            std::thread::sleep(wait + Duration::from_millis(5));
+        }
         self.shared.paused.store(true, Ordering::Relaxed);
+        self.shared.fade.cancel();
+        let _ = self.stream.pause();
     }
 
     /// 暂停/播放切换，返回切换后是否在播放。
@@ -476,6 +538,45 @@ impl Player {
         self.shared.ring.clear();
         self.shared.wake_decoder();
         let _ = self.cmd_tx.send(Cmd::Restart);
+    }
+
+    // -- 均衡器 / 淡变 / 标签 / 捕获 ----------------------------------------
+
+    /// 均衡器句柄。改增益 / 启停后回调下一个 block 生效。
+    pub fn eq(&self) -> &Equalizer {
+        &self.shared.eq
+    }
+
+    /// 淡入淡出句柄。可设自动淡入/淡出时长，或手动触发一次淡变。
+    pub fn fade(&self) -> &FadeState {
+        &self.shared.fade
+    }
+
+    /// 打开文件时提取的标签信息。容器没写标签时字段为 `None`。
+    pub fn metadata(&self) -> &TrackMetadata {
+        &self.shared.metadata
+    }
+
+    /// 启用播放样本捕获，返回一个可读的环形缓冲句柄。
+    ///
+    /// 回调会把**最终输出**（过了 EQ、淡变、音量、声像之后的样本）写进这个缓冲，
+    /// 适合做可视化频谱、电平表、录音。缓冲固定容量，读不及时新样本会覆盖旧的。
+    ///
+    /// 句柄和 `Player` 独立，`Player` drop 后句柄里残留的数据仍可读。
+    pub fn enable_capture(&self) -> Arc<RingBuffer> {
+        self.shared.capture_ring.clear();
+        self.shared.capture_enabled.store(true, Ordering::Relaxed);
+        self.shared.capture_ring.clone()
+    }
+
+    /// 关闭捕获。回调不再写入，句柄里已捕获的数据仍可继续读。
+    pub fn disable_capture(&self) {
+        self.shared.capture_enabled.store(false, Ordering::Relaxed);
+    }
+
+    /// 是否启用捕获。
+    pub fn is_capture_enabled(&self) -> bool {
+        self.shared.capture_enabled.load(Ordering::Relaxed)
     }
 
     // -- Seek ---------------------------------------------------------------
@@ -725,6 +826,14 @@ fn do_seek(shared: &Shared, format: &mut Box<dyn FormatReader>, track_id: u32, t
 
     // 落地到新位置，解除 seeking，回调恢复消费并从目标位置继续推进 position。
     shared.seeking.store(false, Ordering::Relaxed);
+
+    // 重置 EQ 滤波器历史，避免上一个位置的残留采样在跳转后造成瞬态爆音。
+    // 这段只在解码线程跑，回调可能并发 try_lock；拿不到锁就跳过（回调侧自己会处理）。
+    if let Ok(mut eq_state) = shared.eq_state.lock() {
+        eq_state.reset();
+    }
+    // 取消进行中的淡变，避免跳转后音量卡在中间值。
+    shared.fade.reset();
 }
 
 /// park 解码线程一段时间，或直到被唤醒（Seek/Drop）。返回是否被提前唤醒。
@@ -833,6 +942,19 @@ fn audio_callback(out: &mut [f32], shared: &Shared) {
         return;
     }
 
+    // -- 均衡器：先过滤波器，再叠音量/声像/淡变 --
+    // eq_state 只由音频回调读写，锁几乎无竞争；持锁范围仅这一小块。
+    // try_lock 失败说明有别的线程短暂持有（极罕见），这块跳过 EQ，
+    // 只影响几毫秒的滤波，不影响稳定性。
+    if shared.eq.is_enabled()
+        && let Ok(mut eq_state) = shared.eq_state.try_lock()
+    {
+        eq_state.process_interleaved(&shared.eq, &mut tmp[..got]);
+    }
+
+    // -- 淡入淡出：按包络给每个采样乘增益 --
+    shared.fade.process_interleaved(&mut tmp[..got], channels);
+
     let volume = shared.volume_f32();
     let pan = shared.pan_f32();
     // 等功率声像：pan=-1 全左，pan=1 全右。
@@ -850,6 +972,13 @@ fn audio_callback(out: &mut [f32], shared: &Shared) {
     // 请求帧多于得到帧时，尾部补静音。
     for s in &mut out[frames_got * channels..] {
         *s = 0.0;
+    }
+
+    // -- 播放样本捕获：把最终输出（EQ/淡变/音量/声像之后）写进捕获缓冲 --
+    // 满了 push 会丢新样本（写不进去），适合电平表/频谱这类可容忍丢失的场景。
+    if shared.capture_enabled.load(Ordering::Relaxed) {
+        let out_samples = &out[..frames_got * channels];
+        let _ = shared.capture_ring.push(out_samples);
     }
 
     // 按实际消费的帧数推进绝对位置（纳秒）。

@@ -1,34 +1,4 @@
-# ===== Rust =====
-# 构建产物（注意：不忽略根目录 Cargo.lock，按可执行项目提交）
 /target/
-/android/rust-lib/target/
-
-# Rust 备份/编译中间文件
-**/*.rs.bk
-
-# ===== Android / Gradle =====
-# 构建与缓存
-android/app/build/
-android/app/.gradle/
-android/app/.kotlin/
-android/app/local.properties
-android/app/captures/
-android/app/externalNativeBuild/
-android/app/.cxx/
-
-# release 构建产物（APK、mapping.txt 等）
-android/app/app/release/
-
-# 预编译 so（build.sh 生成物，克隆后运行 build.sh 重新生成）
-android/app/app/src/main/jniLibs/**/*.so
-android/rust-lib/jniLibs/**/*.so
-
-# Gradle 全局
-.gradle/
-
-# ===== 签名密钥（切勿上传，含签名私钥）=====
-*.jks
-*.keystore
 
 # ===== IDE / 编辑器 =====
 .idea/

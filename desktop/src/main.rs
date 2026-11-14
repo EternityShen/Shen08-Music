@@ -1,3 +1,5 @@
+use shen08_music::ui::app;
+
 fn main() {
-    println!("Hello, world!");
+    app::App::run();
 }

@@ -10,6 +10,8 @@ symphonia = { version = "0.5", features = ["all"] }
 # URL 播放：HTTP(S) 流式拉取。rustls 避免 OpenSSL 依赖，交叉编译 Android 更省心。
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 
+# 均衡器：把滤波器系数原子地换入实时音频回调，回调里无锁读。
+arc-swap = "1"
 [features]
 default = ["url"]
 url = ["dep:ureq"]
