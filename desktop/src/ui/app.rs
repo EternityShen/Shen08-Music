@@ -1,6 +1,7 @@
 use crate::ui::components::navigator_bar::NavigatorBar;
 use crate::ui::pages::home::HomePage;
 use crate::ui::pages::music::MusicPage;
+use crate::ui::pages::search::SearchPage;
 use gpui_kit::base::{NavMotion, NavOperation, NavStack, NavStackState, PresencePhase, Transition};
 use gpui_kit::*;
 use gpui_pre_reqwest_client::ReqwestClient;
@@ -22,14 +23,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let nav_s = cx.new(|_cx| NavStackState::new());
-        let home_page = cx.new(|_cx| HomePage::new());
-        let music_page = cx.new(|cx| MusicPage::new(cx));
-        nav_s.update(cx, |this, state| {
-            this.push(home_page.clone(), NavMotion::Animated, state);
-        });
-
+    pub fn new(cx: &mut Context<Self>, window: &mut Window) -> Self {
         let config_dir = if let Some(c_d) = dirs::config_dir() {
             c_d.join("shen08-music/")
         } else {
@@ -37,16 +31,26 @@ impl App {
             panic!()
         };
 
-        let music_api_client =
+        let music_api_client = Arc::new(Mutex::new(
             kgmusic_api::client::Api::new(kgmusic_api::session::Paths::new(config_dir))
-                .expect("无法构建Music客户端");
+                .expect("无法构建Music客户端"),
+        ));
 
-        let navigator_bar = cx.new(|_cx| NavigatorBar::new(nav_s.clone(), music_page, home_page));
+        let nav_s = cx.new(|_cx| NavStackState::new());
+        let home_page = cx.new(|_cx| HomePage::new());
+        let music_page = cx.new(|cx| MusicPage::new(cx));
+        let search_page = cx.new(|cx| SearchPage::new(cx, window, music_api_client.clone()));
+        nav_s.update(cx, |this, state| {
+            this.push(home_page.clone(), NavMotion::Animated, state);
+        });
+
+        let navigator_bar =
+            cx.new(|_cx| NavigatorBar::new(nav_s.clone(), music_page, home_page, search_page));
 
         Self {
             navigator: nav_s,
             navigator_bar,
-            music_api_client: Arc::new(Mutex::new(music_api_client)),
+            music_api_client,
         }
     }
 
@@ -54,8 +58,8 @@ impl App {
         application().run(|cx| {
             cx.set_http_client(make_http_client());
             init(cx);
-            open_window(WindowOptions::default(), cx, |_x, cx| {
-                cx.new(|cx| App::new(cx))
+            open_window(WindowOptions::default(), cx, |w, cx| {
+                cx.new(|cx| App::new(cx, w))
             })
             .expect("无法打开窗口");
         })
