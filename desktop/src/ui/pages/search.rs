@@ -7,12 +7,12 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use kgmusic_api::Song;
 use std::sync::{Arc, Mutex};
-
 pub struct SearchPage {
     input_state: Entity<InputState>,
     music_api: Arc<Mutex<kgmusic_api::MusicSource>>,
     music_engine_event_sender: Sender<Event>,
     music_info_sender: Sender<Song>,
+    lyrics_str_sender: Sender<String>,
     cards: Vec<Entity<MusicItemCard>>,
     is_searching: bool,
 }
@@ -24,6 +24,7 @@ impl SearchPage {
         music_api: Arc<Mutex<kgmusic_api::MusicSource>>,
         music_engine_event_sender: Sender<Event>,
         music_info_sender: Sender<Song>,
+        lyrics_str_sender: Sender<String>,
     ) -> Self {
         let input_state = cx.new(|cx| InputState::new(window, cx).placeholder("歌名"));
 
@@ -40,6 +41,7 @@ impl SearchPage {
             music_api,
             music_engine_event_sender,
             music_info_sender,
+            lyrics_str_sender,
             cards: Vec::new(),
             is_searching: false,
         }
@@ -58,6 +60,7 @@ impl SearchPage {
         let music_api = self.music_api.clone();
         let event_sender = self.music_engine_event_sender.clone();
         let info_sender = self.music_info_sender.clone();
+        let lyrics_str_sender = self.lyrics_str_sender.clone();
         cx.spawn(async move |this, cx| {
             let results = cx
                 .background_executor()
@@ -76,8 +79,17 @@ impl SearchPage {
                     .map(|song| {
                         let event_sender = event_sender.clone();
                         let info_sender = info_sender.clone();
+                        let lyrics_str_sender = lyrics_str_sender.clone();
                         let api = this.music_api.clone();
-                        cx.new(|_cx| MusicItemCard::new(song, event_sender, info_sender, api))
+                        cx.new(|_cx| {
+                            MusicItemCard::new(
+                                song,
+                                event_sender,
+                                info_sender,
+                                lyrics_str_sender,
+                                api,
+                            )
+                        })
                     })
                     .collect();
 

@@ -53,6 +53,7 @@ impl Render for MusicInfo {
                             img(url.clone())
                                 .size(px(400.))
                                 .object_fit(ObjectFit::Cover)
+                                .rounded(px(30.))
                                 .with_loading(|| {
                                     gpui_kit::div().child("图片加载中...").into_any_element()
                                 })

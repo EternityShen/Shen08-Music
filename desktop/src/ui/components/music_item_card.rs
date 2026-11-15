@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 
 pub struct MusicItemCard {
     song_data: Song,
+    lyrics_str: String,
     music_engine_event_sender: Sender<Event>,
     music_info_sender: Sender<Song>,
+    lyrics_str_sender: Sender<String>,
     image_url: Option<String>,
     song_url: Option<String>,
     music_api: Arc<Mutex<kgmusic_api::MusicSource>>,
@@ -22,12 +24,15 @@ impl MusicItemCard {
         song_data: Song,
         music_engine_event_sender: Sender<Event>,
         music_info_sender: Sender<Song>,
+        lyrics_str_sender: Sender<String>,
         music_api: Arc<Mutex<kgmusic_api::MusicSource>>,
     ) -> Self {
         Self {
             song_data,
+            lyrics_str: String::new(),
             music_engine_event_sender,
             music_info_sender,
+            lyrics_str_sender,
             image_url: None,
             song_url: None,
             music_api,
@@ -56,9 +61,18 @@ impl MusicItemCard {
                 None
             };
 
+            let lyrics_str = if let Ok(api) = music_api.lock() {
+                api.song_lyrics(&song_data)
+                    .unwrap_or_default()
+                    .unwrap_or(String::from("无"))
+            } else {
+                String::from("无")
+            };
+
             let _ = this.update(cx, |this, cx| {
                 this.song_url = song_url;
                 this.image_url = image_url;
+                this.lyrics_str = lyrics_str;
                 cx.notify();
             });
         })
@@ -128,8 +142,10 @@ impl Render for MusicItemCard {
             .when_some(self.song_url.as_ref(), |div, url| {
                 let url_cloned = url.clone();
                 let song_cloned = self.song_data.clone();
+                let lyrics_str = self.lyrics_str.clone();
                 let engine_event_sender = self.music_engine_event_sender.clone();
                 let music_info_sender = self.music_info_sender.clone();
+                let lyrics_str_sender = self.lyrics_str_sender.clone();
 
                 div.child(
                     Button::new("play")
@@ -170,6 +186,7 @@ impl Render for MusicItemCard {
                             let _ = engine_event_sender
                                 .send_blocking(Event::PlayUrl(url_cloned.clone()));
                             let _ = music_info_sender.send_blocking(song_cloned.clone());
+                            let _ = lyrics_str_sender.send_blocking(lyrics_str.clone());
                         }),
                 )
             })

@@ -1,5 +1,6 @@
 use crate::music_player::engine::Event;
 use crate::music_player::engine::MusicEngine;
+use crate::ui::components::lyrics::Lyrics;
 use crate::ui::components::navigator_bar::NavigatorBar;
 use crate::ui::pages::about::AboutPage;
 use crate::ui::pages::home::HomePage;
@@ -13,7 +14,7 @@ use gpui_kit::base::{
 use gpui_kit::*;
 use gpui_pre_reqwest_client::ReqwestClient;
 use kgmusic_api::Song;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -37,7 +38,10 @@ impl App {
         window: &mut Window,
         music_engine_event_sender: Sender<Event>,
         music_info_sender: Sender<Song>,
+        lyrics_str_sender: Sender<String>,
         music_info_rx: Receiver<Song>,
+        lyrics_str_rx: Receiver<String>,
+        time_rx: Receiver<f64>,
     ) -> Self {
         let config_dir = if let Some(c_d) = dirs::config_dir() {
             c_d.join("shen08-music/")
@@ -52,7 +56,7 @@ impl App {
 
         let nav_s = cx.new(|_cx| NavStackState::new());
         let home_page = cx.new(|_cx| HomePage::new());
-        let music_page = cx.new(|cx| MusicPage::new(cx, music_info_rx));
+        let music_page = cx.new(|cx| MusicPage::new(cx, music_info_rx, lyrics_str_rx, time_rx));
         let search_page = cx.new(|cx| {
             SearchPage::new(
                 cx,
@@ -60,6 +64,7 @@ impl App {
                 music_api_client.clone(),
                 music_engine_event_sender.clone(),
                 music_info_sender.clone(),
+                lyrics_str_sender.clone(),
             )
         });
         let about_page = cx.new(|cx| AboutPage::new(music_api_client.clone(), cx));
@@ -87,6 +92,8 @@ impl App {
     pub fn run() {
         let (engine_tx, engine_rx) = async_channel::unbounded();
         let (music_info_tx, music_info_rx) = async_channel::unbounded();
+        let (lyrics_str_tx, lyrics_str_rx) = async_channel::unbounded();
+        let (time_tx, time_rx) = async_channel::unbounded();
 
         let mut music_engine = MusicEngine::new(engine_rx);
 
@@ -111,7 +118,18 @@ impl App {
             Theme::global_mut(cx).tokens = tokens;
             init(cx);
             open_window(WindowOptions::default(), cx, |w, cx| {
-                cx.new(|cx| App::new(cx, w, engine_tx, music_info_tx, music_info_rx))
+                cx.new(|cx| {
+                    App::new(
+                        cx,
+                        w,
+                        engine_tx,
+                        music_info_tx,
+                        lyrics_str_tx,
+                        music_info_rx,
+                        lyrics_str_rx,
+                        time_rx,
+                    )
+                })
             })
             .expect("无法打开窗口");
         })

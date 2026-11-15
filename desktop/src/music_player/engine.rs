@@ -9,8 +9,6 @@ pub enum Event {
     Play,
     Pause,
     Seek(f64),
-    Next,
-    Prev,
 }
 
 pub struct MusicEngine {
@@ -44,10 +42,6 @@ impl MusicEngine {
         let _result = self.player.seek_time(Duration::from_secs_f64(seek_time));
     }
 
-    fn next(&mut self) {}
-
-    fn prev(&mut self) {}
-
     pub fn start_engine(&mut self) {
         loop {
             if let Ok(event) = self.event_rx.recv_blocking() {
@@ -57,8 +51,6 @@ impl MusicEngine {
                     Event::Play => self.play(),
                     Event::Pause => self.pause(),
                     Event::Seek(time) => self.seek(time),
-                    Event::Next => self.next(),
-                    Event::Prev => self.prev(),
                 }
             }
         }
