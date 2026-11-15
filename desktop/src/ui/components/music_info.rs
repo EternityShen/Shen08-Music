@@ -51,7 +51,7 @@ impl Render for MusicInfo {
                     .when_some(data.album_image_url.as_ref(), |div, url| {
                         div.child(
                             img(url.clone())
-                                .size(px(400.))
+                                .size(px(350.))
                                 .object_fit(ObjectFit::Cover)
                                 .rounded(px(30.))
                                 .with_loading(|| {
