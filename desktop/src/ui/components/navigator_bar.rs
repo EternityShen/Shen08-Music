@@ -1,3 +1,4 @@
+use crate::ui::pages::about::AboutPage;
 use crate::ui::pages::home::HomePage;
 use crate::ui::pages::music::MusicPage;
 use crate::ui::pages::search::SearchPage;
@@ -10,6 +11,7 @@ pub struct NavigatorBar {
     music_page: Entity<MusicPage>,
     home_page: Entity<HomePage>,
     search_page: Entity<SearchPage>,
+    about_page: Entity<AboutPage>,
 }
 
 impl NavigatorBar {
@@ -18,12 +20,14 @@ impl NavigatorBar {
         music_page: Entity<MusicPage>,
         home_page: Entity<HomePage>,
         search_page: Entity<SearchPage>,
+        about_page: Entity<AboutPage>,
     ) -> Self {
         Self {
             navigator,
             music_page,
             home_page,
             search_page,
+            about_page,
         }
     }
 }
@@ -33,10 +37,12 @@ impl Render for NavigatorBar {
         let music_nav = self.navigator.clone();
         let home_nav = self.navigator.clone();
         let search_nav = self.navigator.clone();
+        let about_nav = self.navigator.clone();
 
         let music_page = self.music_page.clone();
         let home_page = self.home_page.clone();
         let search_page = self.search_page.clone();
+        let about_page = self.about_page.clone();
 
         div()
             .flex()
@@ -175,6 +181,46 @@ impl Render for NavigatorBar {
                             })
                             .size(px(40.))
                             .label("S"),
+                    )
+                    .child(
+                        Button::new("About")
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(
+                                        Rgba {
+                                            r: 0.8,
+                                            g: 0.5,
+                                            b: 0.6,
+                                            a: 1.0,
+                                        }
+                                        .into(),
+                                    )
+                                    .hover(
+                                        Rgba {
+                                            r: 0.7,
+                                            g: 0.5,
+                                            b: 0.6,
+                                            a: 1.0,
+                                        }
+                                        .into(),
+                                    )
+                                    .active(
+                                        Rgba {
+                                            r: 0.6,
+                                            g: 0.5,
+                                            b: 0.6,
+                                            a: 1.0,
+                                        }
+                                        .into(),
+                                    ),
+                            )
+                            .on_click(move |_e, _w, cx| {
+                                about_nav.update(cx, |nav, nav_cx| {
+                                    nav.replace(about_page.clone(), NavMotion::Animated, nav_cx);
+                                });
+                            })
+                            .size(px(40.))
+                            .label("A"),
                     ),
             )
     }

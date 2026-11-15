@@ -1,11 +1,20 @@
+use crate::music_player::engine::Event;
+use crate::music_player::engine::MusicEngine;
 use crate::ui::components::navigator_bar::NavigatorBar;
+use crate::ui::pages::about::AboutPage;
 use crate::ui::pages::home::HomePage;
 use crate::ui::pages::music::MusicPage;
 use crate::ui::pages::search::SearchPage;
-use gpui_kit::base::{NavMotion, NavOperation, NavStack, NavStackState, PresencePhase, Transition};
+use gpui_kit::base::{
+    ColorTokens, NavMotion, NavOperation, NavStack, NavStackState, PresencePhase,
+    SemanticThemeTokens, Theme, Transition,
+};
 use gpui_kit::*;
 use gpui_pre_reqwest_client::ReqwestClient;
-use std::sync::{Arc, Mutex};
+use kgmusic_api::Song;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
 
 fn make_http_client() -> Arc<dyn http_client::HttpClient> {
@@ -19,11 +28,17 @@ fn make_http_client() -> Arc<dyn http_client::HttpClient> {
 pub struct App {
     navigator: Entity<NavStackState>,
     navigator_bar: Entity<NavigatorBar>,
-    music_api_client: Arc<Mutex<kgmusic_api::client::Api>>,
+    music_api_client: Arc<Mutex<kgmusic_api::MusicSource>>,
 }
 
 impl App {
-    pub fn new(cx: &mut Context<Self>, window: &mut Window) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        window: &mut Window,
+        music_engine_event_sender: Sender<Event>,
+        music_info_sender: Sender<Song>,
+        music_info_rx: Receiver<Song>,
+    ) -> Self {
         let config_dir = if let Some(c_d) = dirs::config_dir() {
             c_d.join("shen08-music/")
         } else {
@@ -32,20 +47,35 @@ impl App {
         };
 
         let music_api_client = Arc::new(Mutex::new(
-            kgmusic_api::client::Api::new(kgmusic_api::session::Paths::new(config_dir))
-                .expect("无法构建Music客户端"),
+            kgmusic_api::MusicSource::new(config_dir).expect("无法构建Music客户端"),
         ));
 
         let nav_s = cx.new(|_cx| NavStackState::new());
         let home_page = cx.new(|_cx| HomePage::new());
-        let music_page = cx.new(|cx| MusicPage::new(cx));
-        let search_page = cx.new(|cx| SearchPage::new(cx, window, music_api_client.clone()));
+        let music_page = cx.new(|cx| MusicPage::new(cx, music_info_rx));
+        let search_page = cx.new(|cx| {
+            SearchPage::new(
+                cx,
+                window,
+                music_api_client.clone(),
+                music_engine_event_sender.clone(),
+                music_info_sender.clone(),
+            )
+        });
+        let about_page = cx.new(|cx| AboutPage::new(music_api_client.clone(), cx));
         nav_s.update(cx, |this, state| {
             this.push(home_page.clone(), NavMotion::Animated, state);
         });
 
-        let navigator_bar =
-            cx.new(|_cx| NavigatorBar::new(nav_s.clone(), music_page, home_page, search_page));
+        let navigator_bar = cx.new(|_cx| {
+            NavigatorBar::new(
+                nav_s.clone(),
+                music_page,
+                home_page,
+                search_page,
+                about_page,
+            )
+        });
 
         Self {
             navigator: nav_s,
@@ -55,11 +85,33 @@ impl App {
     }
 
     pub fn run() {
+        let (engine_tx, engine_rx) = mpsc::channel();
+        let (music_info_tx, music_info_rx) = mpsc::channel();
+
+        let mut music_engine = MusicEngine::new(engine_rx);
+
+        thread::Builder::new()
+            .name(String::from("music-engine"))
+            .spawn(move || {
+                music_engine.start_engine();
+            })
+            .expect("创建音乐引擎失败");
+
         application().run(|cx| {
             cx.set_http_client(make_http_client());
+
+            let mut tokens = SemanticThemeTokens::default();
+            let is_dark = true;
+            tokens.colors = if is_dark {
+                ColorTokens::dark()
+            } else {
+                ColorTokens::light()
+            };
+
+            Theme::global_mut(cx).tokens = tokens;
             init(cx);
             open_window(WindowOptions::default(), cx, |w, cx| {
-                cx.new(|cx| App::new(cx, w))
+                cx.new(|cx| App::new(cx, w, engine_tx, music_info_tx, music_info_rx))
             })
             .expect("无法打开窗口");
         })

@@ -1,15 +1,21 @@
 use crate::ui::components::music_info::MusicInfo;
 use gpui_kit::*;
+use kgmusic_api::Song;
+use std::sync::mpsc::Receiver;
 
 pub struct MusicPage {
     music_info: Entity<MusicInfo>,
+    music_info_rx: Receiver<Song>,
 }
 
 impl MusicPage {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>, music_info_rx: Receiver<Song>) -> Self {
         let music_info = cx.new(|_cx| MusicInfo::new());
 
-        Self { music_info }
+        Self {
+            music_info,
+            music_info_rx,
+        }
     }
 }
 

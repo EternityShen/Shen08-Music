@@ -6363,6 +6363,7 @@ name = "shen08_music"
 version = "0.1.0"
 dependencies = [
  "audio_lib",
+ "base64 0.23.1",
  "dirs 7.0.0",
  "gpui-kit",
  "gpui-pre-reqwest",
