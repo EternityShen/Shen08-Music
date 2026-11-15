@@ -1,6 +1,6 @@
+use async_channel::Receiver;
 use audio_lib::Player;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 pub enum Event {
@@ -50,7 +50,7 @@ impl MusicEngine {
 
     pub fn start_engine(&mut self) {
         loop {
-            if let Ok(event) = self.event_rx.recv() {
+            if let Ok(event) = self.event_rx.recv_blocking() {
                 match event {
                     Event::PlayUrl(url) => self.play_url(&url),
                     Event::PlayFile(path) => self.play_file(&path),

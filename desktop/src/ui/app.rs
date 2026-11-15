@@ -5,6 +5,7 @@ use crate::ui::pages::about::AboutPage;
 use crate::ui::pages::home::HomePage;
 use crate::ui::pages::music::MusicPage;
 use crate::ui::pages::search::SearchPage;
+use async_channel::{Receiver, Sender};
 use gpui_kit::base::{
     ColorTokens, NavMotion, NavOperation, NavStack, NavStackState, PresencePhase,
     SemanticThemeTokens, Theme, Transition,
@@ -12,7 +13,6 @@ use gpui_kit::base::{
 use gpui_kit::*;
 use gpui_pre_reqwest_client::ReqwestClient;
 use kgmusic_api::Song;
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -85,8 +85,8 @@ impl App {
     }
 
     pub fn run() {
-        let (engine_tx, engine_rx) = mpsc::channel();
-        let (music_info_tx, music_info_rx) = mpsc::channel();
+        let (engine_tx, engine_rx) = async_channel::unbounded();
+        let (music_info_tx, music_info_rx) = async_channel::unbounded();
 
         let mut music_engine = MusicEngine::new(engine_rx);
 

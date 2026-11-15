@@ -1,11 +1,11 @@
 use crate::music_player::engine::Event;
 use crate::ui::components::music_item_card::MusicItemCard;
+use async_channel::Sender;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use kgmusic_api::Song;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub struct SearchPage {
@@ -63,7 +63,7 @@ impl SearchPage {
                 .background_executor()
                 .spawn(async move {
                     if let Ok(api) = music_api.lock() {
-                        api.search(&query, 25).unwrap_or_default()
+                        api.search(&query, 10).unwrap_or_default()
                     } else {
                         Vec::new()
                     }
@@ -90,7 +90,7 @@ impl SearchPage {
 }
 
 impl Render for SearchPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .relative()

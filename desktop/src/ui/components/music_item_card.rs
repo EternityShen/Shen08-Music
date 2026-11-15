@@ -1,10 +1,10 @@
 use crate::music_player::engine::Event;
+use async_channel::Sender;
 use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_kit::component::label::Label;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use kgmusic_api::{Quality, Song};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub struct MusicItemCard {
@@ -74,6 +74,8 @@ impl Render for MusicItemCard {
             .flex()
             .h(px(60.))
             .w_full()
+            .pr(px(20.))
+            .pl(px(20.))
             .flex_row()
             .justify_between()
             .items_center()
@@ -125,7 +127,9 @@ impl Render for MusicItemCard {
             )
             .when_some(self.song_url.as_ref(), |div, url| {
                 let url_cloned = url.clone();
-                let sender = self.music_engine_event_sender.clone();
+                let song_cloned = self.song_data.clone();
+                let engine_event_sender = self.music_engine_event_sender.clone();
+                let music_info_sender = self.music_info_sender.clone();
 
                 div.child(
                     Button::new("play")
@@ -163,7 +167,9 @@ impl Render for MusicItemCard {
                         .label(">")
                         .size(px(40.))
                         .on_click(move |_e, _w, _a| {
-                            let _ = sender.send(Event::PlayUrl(url_cloned.clone()));
+                            let _ = engine_event_sender
+                                .send_blocking(Event::PlayUrl(url_cloned.clone()));
+                            let _ = music_info_sender.send_blocking(song_cloned.clone());
                         }),
                 )
             })

@@ -12,3 +12,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 kgmusic_api = { path = "/home/shen/Work/kgmusic_api" }
 dirs = "7.0.0"
 audio_lib = { path = "libs/audio_lib" }
+async-channel = "2.5.0"
